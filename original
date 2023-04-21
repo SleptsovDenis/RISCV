@@ -1,0 +1,3559 @@
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+ module miriscv_gpr
+  import miriscv_pkg::XLEN;
+  import miriscv_gpr_pkg::*;
+(
+  // Clock, reset
+  input  logic                  clk_i,
+  input  logic                  arstn_i,
+
+  // Write port
+  input  logic                  wr_en_i,
+  input  logic [GPR_ADDR_W-1:0] wr_addr_i,
+  input  logic [XLEN-1:0]       wr_data_i,
+
+  // Read port 1
+  input  logic [GPR_ADDR_W-1:0] r1_addr_i,
+  output logic [XLEN-1:0]       r1_data_o,
+
+  // Read port 2
+  input  logic [GPR_ADDR_W-1:0] r2_addr_i,
+  output logic [XLEN-1:0]       r2_data_o
+  );
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  localparam NUM_WORDS = 2**GPR_ADDR_W;
+
+  logic [NUM_WORDS-1:0][XLEN-1:0] rf_reg;
+  logic [NUM_WORDS-1:0][XLEN-1:0] rf_reg_tmp_ff;
+  logic [NUM_WORDS-1:0]           wr_en_dec;
+
+
+  ///////////////////////////////
+  // General purpose registers //
+  ///////////////////////////////
+
+  // Code to 1-hot convertation
+  always_comb begin : wr_en_decoder
+    for (int i = 0; i < NUM_WORDS; i++) begin
+      if (wr_addr_i == i)
+        wr_en_dec[i] = wr_en_i;
+      else
+        wr_en_dec[i] = 1'b0;
+    end
+  end
+
+  // GPR write
+  genvar i;
+  generate
+    for (i = 1; i < NUM_WORDS; i++) begin : rf_gen
+
+      always_ff @(posedge clk_i or negedge arstn_i) begin : register_write_behavioral
+        if (arstn_i==1'b0) begin
+          rf_reg_tmp_ff[i] <= 'b0;
+        end else begin
+          if (wr_en_dec[i])
+            rf_reg_tmp_ff[i] <= wr_data_i;
+        end
+      end
+    end
+
+    // R0 is nil
+    assign rf_reg[0] = '0;
+    assign rf_reg[NUM_WORDS-1:1] = rf_reg_tmp_ff[NUM_WORDS-1:1];
+
+  endgenerate
+
+  // GPR read
+  assign r1_data_o = rf_reg[r1_addr_i];
+  assign r2_data_o = rf_reg[r2_addr_i];
+
+endmodule: miriscv_gpr
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_alu
+  import miriscv_pkg::XLEN;
+  import miriscv_alu_pkg::*;
+(
+  input  logic [XLEN-1:0]     alu_port_a_i,    // ALU operation first operand
+  input  logic [XLEN-1:0]     alu_port_b_i,    // ALU operation second operand
+  input  logic [ALU_OP_W-1:0] alu_op_i,        // ALU opcode
+  output logic [XLEN-1:0]     alu_result_o,    // ALU result
+
+  output logic                alu_branch_des_o // Comparison result for branch decision
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic [XLEN-1:0]         alu_sum;
+  logic                    alu_cmp;
+  logic [XLEN-1:0]         alu_shift;
+  logic [XLEN-1:0]         alu_bit;
+
+  logic                    carry_out;
+  logic                    op_add;
+
+  logic                    signs_eq;
+  logic                    signed_op;
+
+  logic                    cmp_ne;
+  logic                    cmp_lt;
+
+  logic [$clog2(XLEN)-1:0] shift;
+  logic signed [XLEN-1:0]  sra_res;
+
+
+  ///////////////////////////
+  // Addition-substraction //
+  ///////////////////////////
+
+  assign op_add = (alu_op_i == ALU_ADD);
+
+  assign {carry_out, alu_sum} = op_add ? (alu_port_a_i + alu_port_b_i)
+                                       : (alu_port_a_i - alu_port_b_i);
+
+
+  //////////////////////////////////
+  // Comparison + Branch decision //
+  //////////////////////////////////
+
+  always_comb begin
+    case (alu_op_i)
+      ALU_LT,
+      ALU_GE,
+      ALU_SLT: signed_op = 1'b1;
+
+      default: signed_op = 1'b0;
+    endcase
+  end
+
+  assign signs_eq = (alu_port_a_i[XLEN-1] == alu_port_b_i[XLEN-1]);
+
+  assign cmp_ne = |alu_bit;
+
+  assign cmp_lt  = signs_eq ? carry_out
+                            : (alu_port_a_i[XLEN-1] == signed_op);
+
+  always_comb begin
+    case (alu_op_i)
+      ALU_EQ:  alu_branch_des_o = ~cmp_ne;
+
+      ALU_NE:  alu_branch_des_o = cmp_ne;
+
+      ALU_LT,
+      ALU_LTU: alu_branch_des_o = cmp_lt;
+
+      ALU_GE,
+      ALU_GEU: alu_branch_des_o = ~cmp_lt;
+
+      default: alu_branch_des_o = 1'b0;
+    endcase
+  end
+
+  // SLT and SLTU
+  assign alu_cmp = cmp_lt;
+
+
+  ///////////
+  // Shift //
+  ///////////
+
+  assign shift = alu_port_b_i[$clog2(XLEN)-1:0];
+
+  assign sra_res = $signed(alu_port_a_i) >>> shift;
+
+  always_comb begin
+    case (alu_op_i)
+      ALU_SLL: alu_shift = alu_port_a_i << shift;
+      ALU_SRL: alu_shift = alu_port_a_i >> shift;
+      default: alu_shift = sra_res; // ALU_SRA
+   endcase
+  end
+
+
+  ////////////////////////
+  // Bitwise operations //
+  ////////////////////////
+
+  always_comb begin
+    case (alu_op_i)
+      ALU_OR:  alu_bit = alu_port_a_i | alu_port_b_i;
+
+      ALU_AND: alu_bit = alu_port_a_i & alu_port_b_i;
+
+      default: alu_bit = alu_port_a_i ^ alu_port_b_i; // ALU_EQ, ALU_NE, ALU_XOR
+    endcase
+  end
+
+
+  /////////
+  // MUX //
+  /////////
+
+  always_comb begin
+    case (alu_op_i)
+      ALU_ADD,
+      ALU_SUB:  alu_result_o = alu_sum;
+
+      ALU_SLT,
+      ALU_SLTU: alu_result_o = {{(XLEN-1){1'b0}}, alu_cmp};
+
+      ALU_SLL,
+      ALU_SRL,
+      ALU_SRA:  alu_result_o = alu_shift;
+
+      ALU_XOR,
+      ALU_OR,
+      ALU_AND:  alu_result_o = alu_bit;
+
+      default: alu_result_o = alu_port_b_i; // ALU_JAL
+    endcase
+  end
+
+endmodule
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_memory_stage
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+  import miriscv_gpr_pkg::GPR_ADDR_W;
+  import miriscv_decode_pkg::LSU_DATA;
+  import miriscv_decode_pkg::ALU_DATA;
+  import miriscv_decode_pkg::MDU_DATA;
+  import miriscv_lsu_pkg::MEM_ACCESS_W;
+  import miriscv_decode_pkg::WB_SRC_W;
+#(
+  parameter bit RVFI = 1'b0
+) (
+  // Clock, reset
+  input  logic                    clk_i,
+  input  logic                    arstn_i,
+
+  input  logic                    cu_kill_m_i,
+  input  logic                    cu_stall_m_i,
+  output logic                    m_stall_req_o,
+
+  input  logic                    e_valid_i,
+
+  input  logic [XLEN-1:0]         e_alu_result_i,
+  input  logic [XLEN-1:0]         e_mdu_result_i,
+
+  input  logic                    e_mem_req_i,
+  input  logic                    e_mem_we_i,
+  input  logic [MEM_ACCESS_W-1:0] e_mem_size_i,
+  input  logic [XLEN-1:0]         e_mem_addr_i,
+  input  logic [XLEN-1:0]         e_mem_data_i,
+
+  input  logic                    e_gpr_wr_en_i,
+  input  logic [GPR_ADDR_W-1:0]   e_gpr_wr_addr_i,
+  input  logic [WB_SRC_W-1:0]     e_gpr_src_sel_i,
+
+  input  logic                    e_branch_i,
+  input  logic                    e_jal_i,
+  input  logic                    e_jalr_i,
+  input  logic [XLEN-1:0]         e_target_pc_i,
+  input  logic [XLEN-1:0]         e_next_pc_i,
+  input  logic                    e_prediction_i,
+  input  logic                    e_br_j_taken_i,
+
+  output logic                    m_valid_o,
+  output logic                    m_gpr_wr_en_o,
+  output logic [GPR_ADDR_W-1:0]   m_gpr_wr_addr_o,
+  output logic [XLEN-1:0]         m_gpr_wr_data_o,
+
+  output logic                    m_branch_o,
+  output logic                    m_jal_o,
+  output logic                    m_jalr_o,
+  output logic [XLEN-1:0]         m_target_pc_o,
+  output logic [XLEN-1:0]         m_next_pc_o,
+  output logic                    m_prediction_o,
+  output logic                    m_br_j_taken_o,
+
+  // Data memory interface
+  input  logic                    data_rvalid_i,
+  input  logic [XLEN-1:0]         data_rdata_i,
+  output logic                    data_req_o,
+  output logic                    data_we_o,
+  output logic [XLEN/8-1:0]       data_be_o,
+  output logic [XLEN-1:0]         data_addr_o,
+  output logic [XLEN-1:0]         data_wdata_o,
+
+  // RVFI
+  input  logic                    e_rvfi_wb_we_i,
+  input  logic [GPR_ADDR_W-1:0]   e_rvfi_wb_rd_addr_i,
+  input  logic [ILEN-1:0]         e_rvfi_instr_i,
+  input  logic [GPR_ADDR_W-1:0]   e_rvfi_rs1_addr_i,
+  input  logic [GPR_ADDR_W-1:0]   e_rvfi_rs2_addr_i,
+  input  logic                    e_rvfi_op1_gpr_i,
+  input  logic                    e_rvfi_op2_gpr_i,
+  input  logic [XLEN-1:0]         e_rvfi_rs1_rdata_i,
+  input  logic [XLEN-1:0]         e_rvfi_rs2_rdata_i,
+  input  logic [XLEN-1:0]         e_rvfi_current_pc_i,
+  input  logic [XLEN-1:0]         e_rvfi_next_pc_i,
+  input  logic                    e_rvfi_valid_i,
+  input  logic                    e_rvfi_trap_i,
+  input  logic                    e_rvfi_intr_i,
+  input  logic                    e_rvfi_mem_req_i,
+  input  logic                    e_rvfi_mem_we_i,
+  input  logic [MEM_ACCESS_W-1:0] e_rvfi_mem_size_i,
+  input  logic [XLEN-1:0]         e_rvfi_mem_addr_i,
+  input  logic [XLEN-1:0]         e_rvfi_mem_wdata_i,
+
+  output logic [XLEN-1:0]         m_rvfi_wb_data_o,
+  output logic                    m_rvfi_wb_we_o,
+  output logic [GPR_ADDR_W-1:0]   m_rvfi_wb_rd_addr_o,
+  output logic [ILEN-1:0]         m_rvfi_instr_o,
+  output logic [GPR_ADDR_W-1:0]   m_rvfi_rs1_addr_o,
+  output logic [GPR_ADDR_W-1:0]   m_rvfi_rs2_addr_o,
+  output logic                    m_rvfi_op1_gpr_o,
+  output logic                    m_rvfi_op2_gpr_o,
+  output logic [XLEN-1:0]         m_rvfi_rs1_rdata_o,
+  output logic [XLEN-1:0]         m_rvfi_rs2_rdata_o,
+  output logic [XLEN-1:0]         m_rvfi_current_pc_o,
+  output logic [XLEN-1:0]         m_rvfi_next_pc_o,
+  output logic                    m_rvfi_valid_o,
+  output logic                    m_rvfi_trap_o,
+  output logic                    m_rvfi_intr_o,
+  output logic                    m_rvfi_mem_req_o,
+  output logic                    m_rvfi_mem_we_o,
+  output logic [MEM_ACCESS_W-1:0] m_rvfi_mem_size_o,
+  output logic [XLEN-1:0]         m_rvfi_mem_addr_o,
+  output logic [XLEN-1:0]         m_rvfi_mem_wdata_o,
+  output logic [XLEN-1:0]         m_rvfi_mem_rdata_o
+
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic [XLEN-1:0] lsu_result;
+  logic            lsu_stall_req;
+  logic            lsu_req;
+  logic [XLEN-1:0] m_result;
+
+
+  /////////////////////
+  // Load-Store Unit //
+  /////////////////////
+
+  assign lsu_req = e_mem_req_i & e_valid_i;
+
+  miriscv_lsu
+  i_lsu
+  (
+    .clk_i                   ( clk_i         ),
+    .arstn_i                 ( arstn_i       ),
+
+    .data_rvalid_i           ( data_rvalid_i ),
+    .data_rdata_i            ( data_rdata_i  ),
+    .data_req_o              ( data_req_o    ),
+    .data_we_o               ( data_we_o     ),
+    .data_be_o               ( data_be_o     ),
+    .data_addr_o             ( data_addr_o   ),
+    .data_wdata_o            ( data_wdata_o  ),
+
+    .lsu_req_i               ( lsu_req       ),
+    .lsu_kill_i              ( cu_kill_m_i   ),
+    .lsu_keep_i              ( 1'b0          ),
+    .lsu_we_i                ( e_mem_we_i    ),
+    .lsu_size_i              ( e_mem_size_i  ),
+    .lsu_addr_i              ( e_mem_addr_i  ),
+    .lsu_data_i              ( e_mem_data_i  ),
+    .lsu_data_o              ( lsu_result    ),
+
+    .lsu_stall_o             ( lsu_stall_req )
+  );
+
+
+  ////////////////////////
+  // Writeback data MUX //
+  ////////////////////////
+
+  always_comb begin
+    unique case (e_gpr_src_sel_i)
+      LSU_DATA : m_result = lsu_result;
+      ALU_DATA : m_result = e_alu_result_i;
+      MDU_DATA : m_result = e_mdu_result_i;
+      default  : m_result = e_alu_result_i;
+    endcase
+  end
+
+  assign m_valid_o       = e_valid_i;
+  assign m_gpr_wr_en_o   = e_gpr_wr_en_i & e_valid_i & ~cu_stall_m_i;
+  assign m_gpr_wr_addr_o = e_gpr_wr_addr_i;
+  assign m_gpr_wr_data_o = m_result;
+
+  assign m_branch_o      = e_branch_i;
+  assign m_jal_o         = e_jal_i;
+  assign m_jalr_o        = e_jalr_i;
+  assign m_target_pc_o   = e_target_pc_i;
+  assign m_next_pc_o     = e_next_pc_i;
+  assign m_prediction_o  = e_prediction_i;
+  assign m_br_j_taken_o  = e_br_j_taken_i;
+
+  assign m_stall_req_o   = lsu_stall_req;
+
+
+  ////////////////////
+  // RVFI interface //
+  ////////////////////
+
+  assign m_rvfi_wb_data_o        = m_result;
+  assign m_rvfi_wb_we_o          = e_rvfi_wb_we_i;
+  assign m_rvfi_wb_rd_addr_o     = e_rvfi_wb_rd_addr_i;
+  assign m_rvfi_instr_o          = e_rvfi_instr_i;
+  assign m_rvfi_rs1_addr_o       = e_rvfi_rs1_addr_i;
+  assign m_rvfi_rs2_addr_o       = e_rvfi_rs2_addr_i;
+  assign m_rvfi_op1_gpr_o        = e_rvfi_op1_gpr_i;
+  assign m_rvfi_op2_gpr_o        = e_rvfi_op2_gpr_i;
+  assign m_rvfi_rs1_rdata_o      = e_rvfi_rs1_rdata_i;
+  assign m_rvfi_rs2_rdata_o      = e_rvfi_rs2_rdata_i;
+  assign m_rvfi_current_pc_o     = e_rvfi_current_pc_i;
+  assign m_rvfi_next_pc_o        = e_rvfi_next_pc_i;
+  assign m_rvfi_valid_o          = e_rvfi_valid_i & ~cu_stall_m_i;
+  assign m_rvfi_trap_o           = e_rvfi_trap_i;
+  assign m_rvfi_intr_o           = e_rvfi_intr_i;
+  assign m_rvfi_mem_req_o        = e_rvfi_mem_req_i;
+  assign m_rvfi_mem_we_o         = e_rvfi_mem_we_i;
+  assign m_rvfi_mem_size_o       = e_rvfi_mem_size_i;
+  assign m_rvfi_mem_addr_o       = e_rvfi_mem_addr_i;
+  assign m_rvfi_mem_wdata_o      = e_rvfi_mem_wdata_i;
+  assign m_rvfi_mem_rdata_o      = lsu_result;
+
+
+endmodule
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_execute_stage
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+  import miriscv_gpr_pkg::GPR_ADDR_W;
+  import miriscv_alu_pkg::ALU_OP_W;
+  import miriscv_mdu_pkg::MDU_OP_W;
+  import miriscv_lsu_pkg::MEM_ACCESS_W;
+  import miriscv_decode_pkg::WB_SRC_W;
+#(
+  parameter bit RVFI = 1'b0
+) (
+  // Clock, reset
+  input  logic                    clk_i,
+  input  logic                    arstn_i,
+
+  // Control unit
+  input  logic                    cu_kill_e_i,
+  input  logic                    cu_stall_e_i,
+  output logic                    e_stall_req_o,
+
+  // From Decode
+  input  logic                    d_valid_i,
+
+  input  logic [XLEN-1:0]         d_op1_i,
+  input  logic [XLEN-1:0]         d_op2_i,
+
+  input  logic [ALU_OP_W-1:0]     d_alu_operation_i,
+  input  logic                    d_mdu_req_i,
+  input  logic [MDU_OP_W-1:0]     d_mdu_operation_i,
+
+  input  logic                    d_mem_req_i,
+  input  logic                    d_mem_we_i,
+  input  logic [MEM_ACCESS_W-1:0] d_mem_size_i,
+  input  logic [XLEN-1:0]         d_mem_addr_i,
+  input  logic [XLEN-1:0]         d_mem_data_i,
+
+  input  logic                    d_gpr_wr_en_i,
+  input  logic [GPR_ADDR_W-1:0]   d_gpr_wr_addr_i,
+  input  logic [WB_SRC_W-1:0]     d_gpr_src_sel_i,
+
+  input  logic                    d_branch_i,
+  input  logic                    d_jal_i,
+  input  logic                    d_jalr_i,
+  input  logic [XLEN-1:0]         d_target_pc_i,
+  input  logic [XLEN-1:0]         d_next_pc_i,
+  input  logic                    d_prediction_i,
+  input  logic                    d_br_j_taken_i,
+
+  output logic                    e_valid_o,
+  output logic [XLEN-1:0]         e_alu_result_o,
+  output logic [XLEN-1:0]         e_mdu_result_o,
+
+  // To Memory stage
+  output logic                    e_mem_req_o,
+  output logic                    e_mem_we_o,
+  output logic [MEM_ACCESS_W-1:0] e_mem_size_o,
+  output logic [XLEN-1:0]         e_mem_addr_o,
+  output logic [XLEN-1:0]         e_mem_data_o,
+
+  output logic                    e_gpr_wr_en_o,
+  output logic [GPR_ADDR_W-1:0]   e_gpr_wr_addr_o,
+  output logic [WB_SRC_W-1:0]     e_gpr_src_sel_o,
+
+  output logic                    e_branch_o,
+  output logic                    e_jal_o,
+  output logic                    e_jalr_o,
+  output logic [XLEN-1:0]         e_target_pc_o,
+  output logic [XLEN-1:0]         e_next_pc_o,
+  output logic                    e_prediction_o,
+  output logic                    e_br_j_taken_o,
+
+  // RVFI
+  input  logic                    d_rvfi_wb_we_i,
+  input  logic [GPR_ADDR_W-1:0]   d_rvfi_wb_rd_addr_i,
+  input  logic [ILEN-1:0]         d_rvfi_instr_i,
+  input  logic [GPR_ADDR_W-1:0]   d_rvfi_rs1_addr_i,
+  input  logic [GPR_ADDR_W-1:0]   d_rvfi_rs2_addr_i,
+  input  logic                    d_rvfi_op1_gpr_i,
+  input  logic                    d_rvfi_op2_gpr_i,
+  input  logic [XLEN-1:0]         d_rvfi_rs1_rdata_i,
+  input  logic [XLEN-1:0]         d_rvfi_rs2_rdata_i,
+  input  logic [XLEN-1:0]         d_rvfi_current_pc_i,
+  input  logic [XLEN-1:0]         d_rvfi_next_pc_i,
+  input  logic                    d_rvfi_valid_i,
+  input  logic                    d_rvfi_trap_i,
+  input  logic                    d_rvfi_intr_i,
+  input  logic                    d_rvfi_mem_req_i,
+  input  logic                    d_rvfi_mem_we_i,
+  input  logic [MEM_ACCESS_W-1:0] d_rvfi_mem_size_i,
+  input  logic [XLEN-1:0]         d_rvfi_mem_addr_i,
+  input  logic [XLEN-1:0]         d_rvfi_mem_wdata_i,
+
+  output logic                    e_rvfi_wb_we_o,
+  output logic [GPR_ADDR_W-1:0]   e_rvfi_wb_rd_addr_o,
+  output logic [ILEN-1:0]         e_rvfi_instr_o,
+  output logic [GPR_ADDR_W-1:0]   e_rvfi_rs1_addr_o,
+  output logic [GPR_ADDR_W-1:0]   e_rvfi_rs2_addr_o,
+  output logic                    e_rvfi_op1_gpr_o,
+  output logic                    e_rvfi_op2_gpr_o,
+  output logic [XLEN-1:0]         e_rvfi_rs1_rdata_o,
+  output logic [XLEN-1:0]         e_rvfi_rs2_rdata_o,
+  output logic [XLEN-1:0]         e_rvfi_current_pc_o,
+  output logic [XLEN-1:0]         e_rvfi_next_pc_o,
+  output logic                    e_rvfi_valid_o,
+  output logic                    e_rvfi_trap_o,
+  output logic                    e_rvfi_intr_o,
+  output logic                    e_rvfi_mem_req_o,
+  output logic                    e_rvfi_mem_we_o,
+  output logic [MEM_ACCESS_W-1:0] e_rvfi_mem_size_o,
+  output logic [XLEN-1:0]         e_rvfi_mem_addr_o,
+  output logic [XLEN-1:0]         e_rvfi_mem_wdata_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic [XLEN-1:0]         alu_result;
+  logic                    branch_des;
+
+  logic [XLEN-1:0]         mdu_result;
+  logic                    mdu_stall_req;
+  logic                    mdu_req;
+
+  logic                    e_valid_ff;
+
+  logic [XLEN-1:0]         e_alu_result_ff;
+  logic [XLEN-1:0]         e_mdu_result_ff;
+
+  logic                    e_mem_req_ff;
+  logic                    e_mem_we_ff;
+  logic [MEM_ACCESS_W-1:0] e_mem_size_ff;
+  logic [XLEN-1:0]         e_mem_addr_ff;
+  logic [XLEN-1:0]         e_mem_data_ff;
+
+  logic                    e_gpr_wr_en_ff;
+  logic [GPR_ADDR_W-1:0]   e_gpr_wr_addr_ff;
+  logic [WB_SRC_W-1:0]     e_gpr_src_sel_ff;
+
+  logic                    e_branch_ff;
+  logic                    e_jal_ff;
+  logic                    e_jalr_ff;
+  logic [XLEN-1:0]         e_target_pc_ff;
+  logic [XLEN-1:0]         e_next_pc_ff;
+  logic                    e_prediction_ff;
+  logic                    e_br_j_taken_ff;
+
+
+  /////////////////
+  // ALU and MDU //
+  /////////////////
+
+  miriscv_alu
+  i_alu
+  (
+    .alu_port_a_i      ( d_op1_i           ),
+    .alu_port_b_i      ( d_op2_i           ),
+    .alu_op_i          ( d_alu_operation_i ),
+    .alu_result_o      ( alu_result        ),
+    .alu_branch_des_o  ( branch_des        )
+  );
+
+  assign mdu_req = d_mdu_req_i & d_valid_i;
+
+  miriscv_mdu
+  i_mdu
+  (
+    .clk_i           ( clk_i             ),
+    .arstn_i         ( arstn_i           ),
+    .mdu_req_i       ( mdu_req           ),
+    .mdu_port_a_i    ( d_op1_i           ),
+    .mdu_port_b_i    ( d_op2_i           ),
+    .mdu_op_i        ( d_mdu_operation_i ),
+    .mdu_kill_i      ( cu_kill_e_i       ),
+    .mdu_keep_i      ( 1'b0              ),
+    .mdu_result_o    ( mdu_result        ),
+    .mdu_stall_req_o ( mdu_stall_req     )
+  );
+
+
+  ///////////////////////
+  // Pipeline register //
+  ///////////////////////
+
+  always_ff @(posedge clk_i or negedge arstn_i) begin
+    if (~arstn_i)
+      e_valid_ff <= '0;
+    else if (cu_kill_e_i)
+      e_valid_ff <= '0;
+    else if (~cu_stall_e_i)
+      e_valid_ff <= d_valid_i;
+  end
+
+
+  always_ff @(posedge clk_i) begin
+    if (d_valid_i & ~cu_stall_e_i) begin
+      e_alu_result_ff  <= alu_result;
+      e_mdu_result_ff  <= mdu_result;
+
+      e_mem_req_ff     <= d_mem_req_i;
+      e_mem_we_ff      <= d_mem_we_i;
+      e_mem_size_ff    <= d_mem_size_i;
+      e_mem_addr_ff    <= d_mem_addr_i;
+      e_mem_data_ff    <= d_mem_data_i;
+
+      e_gpr_wr_en_ff   <= d_gpr_wr_en_i;
+      e_gpr_wr_addr_ff <= d_gpr_wr_addr_i;
+      e_gpr_src_sel_ff <= d_gpr_src_sel_i;
+
+      e_branch_ff      <= d_branch_i;
+      e_jal_ff         <= d_jal_i;
+      e_jalr_ff        <= d_jalr_i;
+      e_target_pc_ff   <= d_target_pc_i;
+      e_next_pc_ff     <= d_next_pc_i;
+      e_prediction_ff  <= d_prediction_i;
+      e_br_j_taken_ff  <= d_br_j_taken_i | (d_branch_i & branch_des);
+
+    end
+  end
+
+  assign e_valid_o       = e_valid_ff;
+
+  assign e_alu_result_o  = e_alu_result_ff;
+  assign e_mdu_result_o  = e_mdu_result_ff;
+
+  assign e_mem_req_o     = e_mem_req_ff;
+  assign e_mem_we_o      = e_mem_we_ff;
+  assign e_mem_size_o    = e_mem_size_ff;
+  assign e_mem_addr_o    = e_mem_addr_ff;
+  assign e_mem_data_o    = e_mem_data_ff;
+
+  assign e_gpr_wr_en_o   = e_gpr_wr_en_ff;
+  assign e_gpr_wr_addr_o = e_gpr_wr_addr_ff;
+  assign e_gpr_src_sel_o = e_gpr_src_sel_ff;
+
+  assign e_branch_o      = e_branch_ff;
+  assign e_jal_o         = e_jal_ff;
+  assign e_jalr_o        = e_jalr_ff;
+  assign e_target_pc_o   = e_target_pc_ff;
+  assign e_next_pc_o     = e_next_pc_ff;
+  assign e_prediction_o  = e_prediction_ff;
+  assign e_br_j_taken_o  = e_br_j_taken_ff;
+
+  assign e_stall_req_o   = mdu_stall_req;
+
+
+  ////////////////////
+  // RVFI interface //
+  ////////////////////
+
+  if (RVFI) begin
+    always_ff @(posedge clk_i or negedge arstn_i) begin
+      if(~arstn_i) begin
+        e_rvfi_wb_we_o          <= '0;
+        e_rvfi_wb_rd_addr_o     <= '0;
+        e_rvfi_instr_o          <= '0;
+        e_rvfi_rs1_addr_o       <= '0;
+        e_rvfi_rs2_addr_o       <= '0;
+        e_rvfi_op1_gpr_o        <= '0;
+        e_rvfi_op2_gpr_o        <= '0;
+        e_rvfi_rs1_rdata_o      <= '0;
+        e_rvfi_rs2_rdata_o      <= '0;
+        e_rvfi_current_pc_o     <= '0;
+        e_rvfi_next_pc_o        <= '0;
+        e_rvfi_valid_o          <= '0;
+        e_rvfi_trap_o           <= '0;
+        e_rvfi_intr_o           <= '0;
+        e_rvfi_mem_req_o        <= '0;
+        e_rvfi_mem_we_o         <= '0;
+        e_rvfi_mem_size_o       <= '0;
+        e_rvfi_mem_addr_o       <= '0;
+        e_rvfi_mem_wdata_o      <= '0;
+      end
+
+      else if (cu_kill_e_i) begin
+        e_rvfi_wb_we_o          <= '0;
+        e_rvfi_wb_rd_addr_o     <= '0;
+        e_rvfi_instr_o          <= '0;
+        e_rvfi_rs1_addr_o       <= '0;
+        e_rvfi_rs2_addr_o       <= '0;
+        e_rvfi_op1_gpr_o        <= '0;
+        e_rvfi_op2_gpr_o        <= '0;
+        e_rvfi_rs1_rdata_o      <= '0;
+        e_rvfi_rs2_rdata_o      <= '0;
+        e_rvfi_current_pc_o     <= '0;
+        e_rvfi_next_pc_o        <= '0;
+        e_rvfi_valid_o          <= '0;
+        e_rvfi_trap_o           <= '0;
+        e_rvfi_intr_o           <= '0;
+        e_rvfi_mem_req_o        <= '0;
+        e_rvfi_mem_we_o         <= '0;
+        e_rvfi_mem_size_o       <= '0;
+        e_rvfi_mem_addr_o       <= '0;
+        e_rvfi_mem_wdata_o      <= '0;
+      end
+
+      else if (~cu_stall_e_i) begin
+        e_rvfi_wb_we_o          <= d_rvfi_wb_we_i;
+        e_rvfi_wb_rd_addr_o     <= d_rvfi_wb_rd_addr_i;
+        e_rvfi_instr_o          <= d_rvfi_instr_i;
+        e_rvfi_rs1_addr_o       <= d_rvfi_rs1_addr_i;
+        e_rvfi_rs2_addr_o       <= d_rvfi_rs2_addr_i;
+        e_rvfi_op1_gpr_o        <= d_rvfi_op1_gpr_i;
+        e_rvfi_op2_gpr_o        <= d_rvfi_op2_gpr_i;
+        e_rvfi_rs1_rdata_o      <= d_rvfi_rs1_rdata_i;
+        e_rvfi_rs2_rdata_o      <= d_rvfi_rs2_rdata_i;
+        e_rvfi_current_pc_o     <= d_rvfi_current_pc_i;
+        e_rvfi_next_pc_o        <= d_rvfi_next_pc_i;
+        e_rvfi_valid_o          <= d_rvfi_valid_i;
+        e_rvfi_trap_o           <= d_rvfi_trap_i;
+        e_rvfi_intr_o           <= d_rvfi_intr_i;
+        e_rvfi_mem_req_o        <= d_rvfi_mem_req_i;
+        e_rvfi_mem_we_o         <= d_rvfi_mem_we_i;
+        e_rvfi_mem_size_o       <= d_rvfi_mem_size_i;
+        e_rvfi_mem_addr_o       <= d_rvfi_mem_addr_i;
+        e_rvfi_mem_wdata_o      <= d_rvfi_mem_wdata_i;
+      end
+
+    end
+  end
+
+  else begin
+    assign e_rvfi_wb_we_o          = '0;
+    assign e_rvfi_wb_rd_addr_o     = '0;
+    assign e_rvfi_instr_o          = '0;
+    assign e_rvfi_rs1_addr_o       = '0;
+    assign e_rvfi_rs2_addr_o       = '0;
+    assign e_rvfi_op1_gpr_o        = '0;
+    assign e_rvfi_op2_gpr_o        = '0;
+    assign e_rvfi_rs1_rdata_o      = '0;
+    assign e_rvfi_rs2_rdata_o      = '0;
+    assign e_rvfi_current_pc_o     = '0;
+    assign e_rvfi_next_pc_o        = '0;
+    assign e_rvfi_valid_o          = '0;
+    assign e_rvfi_trap_o           = '0;
+    assign e_rvfi_intr_o           = '0;
+    assign e_rvfi_mem_req_o        = '0;
+    assign e_rvfi_mem_we_o         = '0;
+    assign e_rvfi_mem_size_o       = '0;
+    assign e_rvfi_mem_addr_o       = '0;
+    assign e_rvfi_mem_wdata_o      = '0;
+  end
+
+endmodule
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_core
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+  import miriscv_gpr_pkg::GPR_ADDR_W;
+  import miriscv_alu_pkg::ALU_OP_W;
+  import miriscv_mdu_pkg::MDU_OP_W;
+  import miriscv_lsu_pkg::MEM_ACCESS_W;
+  import miriscv_decode_pkg::WB_SRC_W;
+#(
+  parameter bit RVFI = 1'b1
+) (
+  // Clock, reset
+  input  logic              clk_i,
+  input  logic              arstn_i,
+
+  input  logic [XLEN-1:0]   boot_addr_i,
+
+  // Instruction memory interface
+  input  logic              instr_rvalid_i,
+  input  logic [XLEN-1:0]   instr_rdata_i,
+  output logic              instr_req_o,
+  output logic [XLEN-1:0]   instr_addr_o,
+
+  // Data memory interface
+  input  logic              data_rvalid_i,
+  input  logic [XLEN-1:0]   data_rdata_i,
+  output logic              data_req_o,
+  output logic              data_we_o,
+  output logic [XLEN/8-1:0] data_be_o,
+  output logic [XLEN-1:0]   data_addr_o,
+  output logic [XLEN-1:0]   data_wdata_o,
+
+  // RVFI
+  output logic              rvfi_valid_o,
+  output logic [63:0]       rvfi_order_o,
+  output logic [31:0]       rvfi_insn_o,
+  output logic              rvfi_trap_o,
+  output logic              rvfi_halt_o,
+  output logic              rvfi_intr_o,
+  output logic [ 1:0]       rvfi_mode_o,
+  output logic [ 1:0]       rvfi_ixl_o,
+  output logic [ 4:0]       rvfi_rs1_addr_o,
+  output logic [ 4:0]       rvfi_rs2_addr_o,
+  output logic [31:0]       rvfi_rs1_rdata_o,
+  output logic [31:0]       rvfi_rs2_rdata_o,
+  output logic [ 4:0]       rvfi_rd_addr_o,
+  output logic [31:0]       rvfi_rd_wdata_o,
+  output logic [31:0]       rvfi_pc_rdata_o,
+  output logic [31:0]       rvfi_pc_wdata_o,
+  output logic [31:0]       rvfi_mem_addr_o,
+  output logic [ 3:0]       rvfi_mem_rmask_o,
+  output logic [ 3:0]       rvfi_mem_wmask_o,
+  output logic [31:0]       rvfi_mem_rdata_o,
+  output logic [31:0]       rvfi_mem_wdata_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  localparam f = 3'd0; // fetch
+  localparam d = 3'd1; // decode
+  localparam e = 3'd2; // execute
+  localparam m = 3'd3; // memory
+  localparam w = 3'd4; // writeback
+
+  logic [XLEN-1:0]         current_pc      [f:f];
+  logic [XLEN-1:0]         next_pc         [f:m];
+
+  logic [ILEN-1:0]         instr           [f:f];
+  logic                    valid           [f:m];
+
+  logic                    gpr_wr_en       [d:m];
+  logic [GPR_ADDR_W-1:0]   gpr_wr_addr     [d:m];
+  logic [WB_SRC_W-1:0]     gpr_src_sel     [d:e];
+  logic [XLEN-1:0]         gpr_wr_data     [m:m];
+
+  logic [XLEN-1:0]         op1             [d:d];
+  logic [XLEN-1:0]         op2             [d:d];
+
+  logic [XLEN-1:0]         alu_result      [e:e];
+  logic [XLEN-1:0]         mdu_result      [e:e];
+
+  logic [ALU_OP_W-1:0]     alu_operation   [d:d];
+  logic                    mdu_req         [d:d];
+  logic [MDU_OP_W-1:0]     mdu_operation   [d:d];
+
+  logic                    mem_req         [d:e];
+  logic                    mem_we          [d:e];
+  logic [MEM_ACCESS_W-1:0] mem_size        [d:e];
+  logic [XLEN-1:0]         mem_addr        [d:e];
+  logic [XLEN-1:0]         mem_data        [d:e];
+
+  logic                    branch          [d:m];
+  logic                    jal             [d:m];
+  logic                    jalr            [d:m];
+  logic [XLEN-1:0]         target_pc       [d:m];
+  logic                    prediction      [d:m];
+  logic                    br_j_taken      [d:m];
+
+  logic                    cu_stall_req    [f:m];
+  logic                    cu_stall        [f:m];
+  logic                    cu_kill         [f:m];
+  logic                    cu_force        [f:f];
+  logic [XLEN-1:0]         cu_force_pc     [f:f];
+
+  logic [GPR_ADDR_W-1:0]   cu_rs1_addr     [f:f];
+  logic                    cu_rs1_req      [f:f];
+  logic [GPR_ADDR_W-1:0]   cu_rs2_addr     [f:f];
+  logic                    cu_rs2_req      [f:f];
+
+  logic [XLEN-1:0]         rvfi_wb_data    [m:w];
+  logic                    rvfi_wb_we      [f:w];
+  logic [GPR_ADDR_W-1:0]   rvfi_wb_rd_addr [f:w];
+
+  logic [ILEN-1:0]         rvfi_instr      [f:w];
+  logic [GPR_ADDR_W-1:0]   rvfi_rs1_addr   [f:w];
+  logic [GPR_ADDR_W-1:0]   rvfi_rs2_addr   [f:w];
+  logic                    rvfi_op1_gpr    [f:w];
+  logic                    rvfi_op2_gpr    [f:w];
+  logic [XLEN-1:0]         rvfi_rs1_rdata  [f:w];
+  logic [XLEN-1:0]         rvfi_rs2_rdata  [f:w];
+  logic [XLEN-1:0]         rvfi_current_pc [f:w];
+  logic [XLEN-1:0]         rvfi_next_pc    [f:w];
+  logic                    rvfi_valid      [f:w];
+  logic                    rvfi_trap       [f:w];
+  logic                    rvfi_intr       [f:w];
+
+  logic                    rvfi_mem_req    [f:w];
+  logic                    rvfi_mem_we     [f:w];
+  logic [MEM_ACCESS_W-1:0] rvfi_mem_size   [f:w];
+  logic [XLEN-1:0]         rvfi_mem_addr   [f:w];
+  logic [XLEN-1:0]         rvfi_mem_wdata  [f:w];
+  logic [XLEN-1:0]         rvfi_mem_rdata  [m:w];
+
+
+  /////////////////
+  // Fetch stage //
+  /////////////////
+
+  miriscv_fetch_stage
+  #(
+    .RVFI ( RVFI )
+  )
+  i_fetch_stage
+  (
+    .clk_i          ( clk_i              ),
+    .arstn_i        ( arstn_i            ),
+
+    .cu_kill_f_i    ( cu_kill        [f] ),
+    .cu_stall_f_i   ( cu_stall       [f] ),
+    .cu_force_f_i   ( cu_force       [f] ),
+    .cu_force_pc_i  ( cu_force_pc    [f] ),
+    .f_stall_req_o  ( cu_stall_req   [f] ),
+
+    .instr_rvalid_i ( instr_rvalid_i     ),
+    .instr_rdata_i  ( instr_rdata_i      ),
+    .instr_req_o    ( instr_req_o        ),
+    .instr_addr_o   ( instr_addr_o       ),
+
+    .f_instr_o      ( instr          [f] ),
+    .f_current_pc_o ( current_pc     [f] ),
+    .f_next_pc_o    ( next_pc        [f] ),
+    .f_valid_o      ( valid          [f] )
+  );
+
+
+  //////////////////
+  // Decode stage //
+  //////////////////
+
+  miriscv_decode_stage
+  #(
+    .RVFI ( RVFI )
+  )
+  i_decode_stage
+  (
+    .clk_i               ( clk_i               ),
+    .arstn_i             ( arstn_i             ),
+
+    .cu_kill_d_i         ( cu_kill         [d] ),
+    .cu_stall_d_i        ( cu_stall        [d] ),
+    .cu_stall_f_i        ( cu_stall        [f] ),
+    .d_stall_req_o       ( cu_stall_req    [d] ),
+
+    .f_instr_i           ( instr           [f] ),
+    .f_current_pc_i      ( current_pc      [f] ),
+    .f_next_pc_i         ( next_pc         [f] ),
+    .f_valid_i           ( valid           [f] ),
+
+    .m_gpr_wr_en_i       ( gpr_wr_en       [m] ),
+    .m_gpr_wr_data_i     ( gpr_wr_data     [m] ),
+    .m_gpr_wr_addr_i     ( gpr_wr_addr     [m] ),
+
+    .d_valid_o           ( valid           [d] ),
+
+    .d_op1_o             ( op1             [d] ),
+    .d_op2_o             ( op2             [d] ),
+
+    .d_alu_operation_o   ( alu_operation   [d] ),
+    .d_mdu_req_o         ( mdu_req         [d] ),
+    .d_mdu_operation_o   ( mdu_operation   [d] ),
+
+    .d_mem_req_o         ( mem_req         [d] ),
+    .d_mem_we_o          ( mem_we          [d] ),
+    .d_mem_size_o        ( mem_size        [d] ),
+    .d_mem_addr_o        ( mem_addr        [d] ),
+    .d_mem_data_o        ( mem_data        [d] ),
+
+    .d_gpr_wr_en_o       ( gpr_wr_en       [d] ),
+    .d_gpr_wr_addr_o     ( gpr_wr_addr     [d] ),
+    .d_gpr_src_sel_o     ( gpr_src_sel     [d] ),
+
+    .d_branch_o          ( branch          [d] ),
+    .d_jal_o             ( jal             [d] ),
+    .d_jalr_o            ( jalr            [d] ),
+    .d_target_pc_o       ( target_pc       [d] ),
+    .d_next_pc_o         ( next_pc         [d] ),
+    .d_prediction_o      ( prediction      [d] ),
+    .d_br_j_taken_o      ( br_j_taken      [d] ),
+
+    .f_cu_rs1_addr_o     ( cu_rs1_addr     [f] ),
+    .f_cu_rs1_req_o      ( cu_rs1_req      [f] ),
+    .f_cu_rs2_addr_o     ( cu_rs2_addr     [f] ),
+    .f_cu_rs2_req_o      ( cu_rs2_req      [f] ),
+
+    .d_rvfi_wb_we_o      ( rvfi_wb_we      [d] ),
+    .d_rvfi_wb_rd_addr_o ( rvfi_wb_rd_addr [d] ),
+    .d_rvfi_instr_o      ( rvfi_instr      [d] ),
+    .d_rvfi_rs1_addr_o   ( rvfi_rs1_addr   [d] ),
+    .d_rvfi_rs2_addr_o   ( rvfi_rs2_addr   [d] ),
+    .d_rvfi_op1_gpr_o    ( rvfi_op1_gpr    [d] ),
+    .d_rvfi_op2_gpr_o    ( rvfi_op2_gpr    [d] ),
+    .d_rvfi_rs1_rdata_o  ( rvfi_rs1_rdata  [d] ),
+    .d_rvfi_rs2_rdata_o  ( rvfi_rs2_rdata  [d] ),
+    .d_rvfi_current_pc_o ( rvfi_current_pc [d] ),
+    .d_rvfi_next_pc_o    ( rvfi_next_pc    [d] ),
+    .d_rvfi_valid_o      ( rvfi_valid      [d] ),
+    .d_rvfi_trap_o       ( rvfi_trap       [d] ),
+    .d_rvfi_intr_o       ( rvfi_intr       [d] ),
+    .d_rvfi_mem_req_o    ( rvfi_mem_req    [d] ),
+    .d_rvfi_mem_we_o     ( rvfi_mem_we     [d] ),
+    .d_rvfi_mem_size_o   ( rvfi_mem_size   [d] ),
+    .d_rvfi_mem_addr_o   ( rvfi_mem_addr   [d] ),
+    .d_rvfi_mem_wdata_o  ( rvfi_mem_wdata  [d] )
+  );
+
+
+  ///////////////////
+  // Execute stage //
+  ///////////////////
+
+  miriscv_execute_stage
+  #(
+    .RVFI ( RVFI )
+  )
+  i_execute_stage
+  (
+    .clk_i               ( clk_i               ),
+    .arstn_i             ( arstn_i             ),
+
+    .cu_kill_e_i         ( cu_kill         [e] ),
+    .cu_stall_e_i        ( cu_stall        [e] ),
+    .e_stall_req_o       ( cu_stall_req    [e] ),
+
+    .d_valid_i           ( valid           [d] ),
+
+    .d_op1_i             ( op1             [d] ),
+    .d_op2_i             ( op2             [d] ),
+
+    .d_alu_operation_i   ( alu_operation   [d] ),
+    .d_mdu_req_i         ( mdu_req         [d] ),
+    .d_mdu_operation_i   ( mdu_operation   [d] ),
+
+    .d_mem_req_i         ( mem_req         [d] ),
+    .d_mem_we_i          ( mem_we          [d] ),
+    .d_mem_size_i        ( mem_size        [d] ),
+    .d_mem_addr_i        ( mem_addr        [d] ),
+    .d_mem_data_i        ( mem_data        [d] ),
+
+    .d_gpr_wr_en_i       ( gpr_wr_en       [d] ),
+    .d_gpr_wr_addr_i     ( gpr_wr_addr     [d] ),
+    .d_gpr_src_sel_i     ( gpr_src_sel     [d] ),
+
+    .d_branch_i          ( branch          [d] ),
+    .d_jal_i             ( jal             [d] ),
+    .d_jalr_i            ( jalr            [d] ),
+    .d_target_pc_i       ( target_pc       [d] ),
+    .d_next_pc_i         ( next_pc         [d] ),
+    .d_prediction_i      ( prediction      [d] ),
+    .d_br_j_taken_i      ( br_j_taken      [d] ),
+
+    .e_valid_o           ( valid           [e] ),
+
+    .e_alu_result_o      ( alu_result      [e] ),
+    .e_mdu_result_o      ( mdu_result      [e] ),
+
+    .e_mem_req_o         ( mem_req         [e] ),
+    .e_mem_we_o          ( mem_we          [e] ),
+    .e_mem_size_o        ( mem_size        [e] ),
+    .e_mem_addr_o        ( mem_addr        [e] ),
+    .e_mem_data_o        ( mem_data        [e] ),
+
+    .e_gpr_wr_en_o       ( gpr_wr_en       [e] ),
+    .e_gpr_wr_addr_o     ( gpr_wr_addr     [e] ),
+    .e_gpr_src_sel_o     ( gpr_src_sel     [e] ),
+
+    .e_branch_o          ( branch          [e] ),
+    .e_jal_o             ( jal             [e] ),
+    .e_jalr_o            ( jalr            [e] ),
+    .e_target_pc_o       ( target_pc       [e] ),
+    .e_next_pc_o         ( next_pc         [e] ),
+    .e_prediction_o      ( prediction      [e] ),
+    .e_br_j_taken_o      ( br_j_taken      [e] ),
+
+    .d_rvfi_wb_we_i      ( rvfi_wb_we      [d] ),
+    .d_rvfi_wb_rd_addr_i ( rvfi_wb_rd_addr [d] ),
+    .d_rvfi_instr_i      ( rvfi_instr      [d] ),
+    .d_rvfi_rs1_addr_i   ( rvfi_rs1_addr   [d] ),
+    .d_rvfi_rs2_addr_i   ( rvfi_rs2_addr   [d] ),
+    .d_rvfi_op1_gpr_i    ( rvfi_op1_gpr    [d] ),
+    .d_rvfi_op2_gpr_i    ( rvfi_op2_gpr    [d] ),
+    .d_rvfi_rs1_rdata_i  ( rvfi_rs1_rdata  [d] ),
+    .d_rvfi_rs2_rdata_i  ( rvfi_rs2_rdata  [d] ),
+    .d_rvfi_current_pc_i ( rvfi_current_pc [d] ),
+    .d_rvfi_next_pc_i    ( rvfi_next_pc    [d] ),
+    .d_rvfi_valid_i      ( rvfi_valid      [d] ),
+    .d_rvfi_trap_i       ( rvfi_trap       [d] ),
+    .d_rvfi_intr_i       ( rvfi_intr       [d] ),
+    .d_rvfi_mem_req_i    ( rvfi_mem_req    [d] ),
+    .d_rvfi_mem_we_i     ( rvfi_mem_we     [d] ),
+    .d_rvfi_mem_size_i   ( rvfi_mem_size   [d] ),
+    .d_rvfi_mem_addr_i   ( rvfi_mem_addr   [d] ),
+    .d_rvfi_mem_wdata_i  ( rvfi_mem_wdata  [d] ),
+
+    .e_rvfi_wb_we_o      ( rvfi_wb_we      [e] ),
+    .e_rvfi_wb_rd_addr_o ( rvfi_wb_rd_addr [e] ),
+    .e_rvfi_instr_o      ( rvfi_instr      [e] ),
+    .e_rvfi_rs1_addr_o   ( rvfi_rs1_addr   [e] ),
+    .e_rvfi_rs2_addr_o   ( rvfi_rs2_addr   [e] ),
+    .e_rvfi_op1_gpr_o    ( rvfi_op1_gpr    [e] ),
+    .e_rvfi_op2_gpr_o    ( rvfi_op2_gpr    [e] ),
+    .e_rvfi_rs1_rdata_o  ( rvfi_rs1_rdata  [e] ),
+    .e_rvfi_rs2_rdata_o  ( rvfi_rs2_rdata  [e] ),
+    .e_rvfi_current_pc_o ( rvfi_current_pc [e] ),
+    .e_rvfi_next_pc_o    ( rvfi_next_pc    [e] ),
+    .e_rvfi_valid_o      ( rvfi_valid      [e] ),
+    .e_rvfi_trap_o       ( rvfi_trap       [e] ),
+    .e_rvfi_intr_o       ( rvfi_intr       [e] ),
+    .e_rvfi_mem_req_o    ( rvfi_mem_req    [e] ),
+    .e_rvfi_mem_we_o     ( rvfi_mem_we     [e] ),
+    .e_rvfi_mem_size_o   ( rvfi_mem_size   [e] ),
+    .e_rvfi_mem_addr_o   ( rvfi_mem_addr   [e] ),
+    .e_rvfi_mem_wdata_o  ( rvfi_mem_wdata  [e] )
+  );
+
+
+  //////////////////
+  // Memory stage //
+  //////////////////
+
+  miriscv_memory_stage
+  #(
+    .RVFI ( RVFI )
+  )
+  i_memory_stage
+  (
+    .clk_i               ( clk_i               ),
+    .arstn_i             ( arstn_i             ),
+
+    .cu_kill_m_i         ( cu_kill         [m] ),
+    .cu_stall_m_i        ( cu_stall        [m] ),
+    .m_stall_req_o       ( cu_stall_req    [m] ),
+
+    .e_valid_i           ( valid           [e] ),
+
+    .e_alu_result_i      ( alu_result      [e] ),
+    .e_mdu_result_i      ( mdu_result      [e] ),
+
+    .e_mem_req_i         ( mem_req         [e] ),
+    .e_mem_we_i          ( mem_we          [e] ),
+    .e_mem_size_i        ( mem_size        [e] ),
+    .e_mem_addr_i        ( mem_addr        [e] ),
+    .e_mem_data_i        ( mem_data        [e] ),
+
+    .e_gpr_wr_en_i       ( gpr_wr_en       [e] ),
+    .e_gpr_wr_addr_i     ( gpr_wr_addr     [e] ),
+    .e_gpr_src_sel_i     ( gpr_src_sel     [e] ),
+
+    .e_branch_i          ( branch          [e] ),
+    .e_jal_i             ( jal             [e] ),
+    .e_jalr_i            ( jalr            [e] ),
+    .e_target_pc_i       ( target_pc       [e] ),
+    .e_next_pc_i         ( next_pc         [e] ),
+    .e_prediction_i      ( prediction      [e] ),
+    .e_br_j_taken_i      ( br_j_taken      [e] ),
+
+    .m_valid_o           ( valid           [m] ),
+    .m_gpr_wr_en_o       ( gpr_wr_en       [m] ),
+    .m_gpr_wr_addr_o     ( gpr_wr_addr     [m] ),
+    .m_gpr_wr_data_o     ( gpr_wr_data     [m] ),
+
+    .m_branch_o          ( branch          [m] ),
+    .m_jal_o             ( jal             [m] ),
+    .m_jalr_o            ( jalr            [m] ),
+    .m_target_pc_o       ( target_pc       [m] ),
+    .m_next_pc_o         ( next_pc         [m] ),
+    .m_prediction_o      ( prediction      [m] ),
+    .m_br_j_taken_o      ( br_j_taken      [m] ),
+
+    .data_rvalid_i       ( data_rvalid_i       ),
+    .data_rdata_i        ( data_rdata_i        ),
+    .data_req_o          ( data_req_o          ),
+    .data_we_o           ( data_we_o           ),
+    .data_be_o           ( data_be_o           ),
+    .data_addr_o         ( data_addr_o         ),
+    .data_wdata_o        ( data_wdata_o        ),
+
+    .e_rvfi_wb_we_i      ( rvfi_wb_we      [e] ),
+    .e_rvfi_wb_rd_addr_i ( rvfi_wb_rd_addr [e] ),
+    .e_rvfi_instr_i      ( rvfi_instr      [e] ),
+    .e_rvfi_rs1_addr_i   ( rvfi_rs1_addr   [e] ),
+    .e_rvfi_rs2_addr_i   ( rvfi_rs2_addr   [e] ),
+    .e_rvfi_op1_gpr_i    ( rvfi_op1_gpr    [e] ),
+    .e_rvfi_op2_gpr_i    ( rvfi_op2_gpr    [e] ),
+    .e_rvfi_rs1_rdata_i  ( rvfi_rs1_rdata  [e] ),
+    .e_rvfi_rs2_rdata_i  ( rvfi_rs2_rdata  [e] ),
+    .e_rvfi_current_pc_i ( rvfi_current_pc [e] ),
+    .e_rvfi_next_pc_i    ( rvfi_next_pc    [e] ),
+    .e_rvfi_valid_i      ( rvfi_valid      [e] ),
+    .e_rvfi_trap_i       ( rvfi_trap       [e] ),
+    .e_rvfi_intr_i       ( rvfi_intr       [e] ),
+    .e_rvfi_mem_req_i    ( rvfi_mem_req    [e] ),
+    .e_rvfi_mem_we_i     ( rvfi_mem_we     [e] ),
+    .e_rvfi_mem_size_i   ( rvfi_mem_size   [e] ),
+    .e_rvfi_mem_addr_i   ( rvfi_mem_addr   [e] ),
+    .e_rvfi_mem_wdata_i  ( rvfi_mem_wdata  [e] ),
+
+    .m_rvfi_wb_data_o    ( rvfi_wb_data    [m] ),
+    .m_rvfi_wb_we_o      ( rvfi_wb_we      [m] ),
+    .m_rvfi_wb_rd_addr_o ( rvfi_wb_rd_addr [m] ),
+    .m_rvfi_instr_o      ( rvfi_instr      [m] ),
+    .m_rvfi_rs1_addr_o   ( rvfi_rs1_addr   [m] ),
+    .m_rvfi_rs2_addr_o   ( rvfi_rs2_addr   [m] ),
+    .m_rvfi_op1_gpr_o    ( rvfi_op1_gpr    [m] ),
+    .m_rvfi_op2_gpr_o    ( rvfi_op2_gpr    [m] ),
+    .m_rvfi_rs1_rdata_o  ( rvfi_rs1_rdata  [m] ),
+    .m_rvfi_rs2_rdata_o  ( rvfi_rs2_rdata  [m] ),
+    .m_rvfi_current_pc_o ( rvfi_current_pc [m] ),
+    .m_rvfi_next_pc_o    ( rvfi_next_pc    [m] ),
+    .m_rvfi_valid_o      ( rvfi_valid      [m] ),
+    .m_rvfi_trap_o       ( rvfi_trap       [m] ),
+    .m_rvfi_intr_o       ( rvfi_intr       [m] ),
+    .m_rvfi_mem_req_o    ( rvfi_mem_req    [m] ),
+    .m_rvfi_mem_we_o     ( rvfi_mem_we     [m] ),
+    .m_rvfi_mem_size_o   ( rvfi_mem_size   [m] ),
+    .m_rvfi_mem_addr_o   ( rvfi_mem_addr   [m] ),
+    .m_rvfi_mem_wdata_o  ( rvfi_mem_wdata  [m] ),
+    .m_rvfi_mem_rdata_o  ( rvfi_mem_rdata  [m] )
+  );
+
+
+  //////////////////
+  // Control Unit //
+  //////////////////
+
+  miriscv_control_unit
+  i_control_unit
+  (
+    .clk_i              ( clk_i              ),
+    .arstn_i            ( arstn_i            ),
+
+    .boot_addr_i        ( boot_addr_i        ),
+
+    .f_stall_req_i      ( cu_stall_req   [f] ),
+    .d_stall_req_i      ( cu_stall_req   [d] ),
+    .e_stall_req_i      ( cu_stall_req   [e] ),
+    .m_stall_req_i      ( cu_stall_req   [m] ),
+
+    .f_valid_i          ( valid          [f] ),
+    .d_valid_i          ( valid          [d] ),
+    .e_valid_i          ( valid          [e] ),
+    .m_valid_i          ( valid          [m] ),
+
+    .f_cu_rs1_addr_i    ( cu_rs1_addr    [f] ),
+    .f_cu_rs1_req_i     ( cu_rs1_req     [f] ),
+    .f_cu_rs2_addr_i    ( cu_rs2_addr    [f] ),
+    .f_cu_rs2_req_i     ( cu_rs2_req     [f] ),
+
+    .d_cu_rd_addr_i     ( gpr_wr_addr    [d] ),
+    .d_cu_rd_we_i       ( gpr_wr_en      [d] ),
+
+    .e_cu_rd_addr_i     ( gpr_wr_addr    [e] ),
+    .e_cu_rd_we_i       ( gpr_wr_en      [e] ),
+
+    .m_branch_i         ( branch         [m] ),
+    .m_jal_i            ( jal            [m] ),
+    .m_jalr_i           ( jalr           [m] ),
+    .m_target_pc_i      ( target_pc      [m] ),
+    .m_next_pc_i        ( next_pc        [m] ),
+    .m_prediction_i     ( prediction     [m] ),
+    .m_br_j_taken_i     ( br_j_taken     [m] ),
+
+    .cu_stall_f_o       ( cu_stall       [f] ),
+    .cu_stall_d_o       ( cu_stall       [d] ),
+    .cu_stall_e_o       ( cu_stall       [e] ),
+    .cu_stall_m_o       ( cu_stall       [m] ),
+
+    .cu_kill_f_o        ( cu_kill        [f] ),
+    .cu_kill_d_o        ( cu_kill        [d] ),
+    .cu_kill_e_o        ( cu_kill        [e] ),
+    .cu_kill_m_o        ( cu_kill        [m] ),
+
+    .cu_force_pc_o      ( cu_force_pc    [f] ),
+    .cu_force_f_o       ( cu_force       [f] )
+  );
+
+
+  //////////
+  // RVFI //
+  //////////
+
+  assign rvfi_instr      [w] = rvfi_instr      [m];
+  assign rvfi_rs1_addr   [w] = rvfi_rs1_addr   [m];
+  assign rvfi_rs2_addr   [w] = rvfi_rs2_addr   [m];
+  assign rvfi_op1_gpr    [w] = rvfi_op1_gpr    [m];
+  assign rvfi_op2_gpr    [w] = rvfi_op2_gpr    [m];
+  assign rvfi_rs1_rdata  [w] = rvfi_rs1_rdata  [m];
+  assign rvfi_rs2_rdata  [w] = rvfi_rs2_rdata  [m];
+  assign rvfi_wb_rd_addr [w] = rvfi_wb_rd_addr [m];
+  assign rvfi_wb_we      [w] = rvfi_wb_we      [m];
+  assign rvfi_wb_data    [w] = rvfi_wb_data    [m];
+  assign rvfi_mem_we     [w] = rvfi_mem_we     [m];
+  assign rvfi_mem_req    [w] = rvfi_mem_req    [m];
+  assign rvfi_mem_size   [w] = rvfi_mem_size   [m];
+  assign rvfi_mem_addr   [w] = rvfi_mem_addr   [m];
+  assign rvfi_mem_wdata  [w] = rvfi_mem_wdata  [m];
+  assign rvfi_mem_rdata  [w] = rvfi_mem_rdata  [m];
+  assign rvfi_current_pc [w] = rvfi_current_pc [m];
+  assign rvfi_next_pc    [w] = rvfi_next_pc    [m];
+  assign rvfi_valid      [w] = rvfi_valid      [m];
+  assign rvfi_intr       [w] = rvfi_intr       [m];
+  assign rvfi_trap       [w] = rvfi_trap       [m];
+
+
+  if (RVFI) begin
+    miriscv_rvfi_controller
+    i_rvfi
+    (
+      .clk_i            ( clk_i                ),
+      .aresetn_i        ( arstn_i              ),
+      .w_instr_i        ( rvfi_instr       [w] ),
+      .w_rs1_addr_i     ( rvfi_rs1_addr    [w] ),
+      .w_rs2_addr_i     ( rvfi_rs2_addr    [w] ),
+      .w_op1_gpr_i      ( rvfi_op1_gpr     [w] ),
+      .w_op2_gpr_i      ( rvfi_op2_gpr     [w] ),
+      .w_rs1_rdata_i    ( rvfi_rs1_rdata   [w] ),
+      .w_rs2_rdata_i    ( rvfi_rs2_rdata   [w] ),
+      .w_wb_rd_addr_i   ( rvfi_wb_rd_addr  [w] ),
+      .w_wb_we_i        ( rvfi_wb_we       [w] ),
+      .w_wb_data_i      ( rvfi_wb_data     [w] ),
+      .w_data_we_i      ( rvfi_mem_we      [w] ),
+      .w_data_req_i     ( rvfi_mem_req     [w] ),
+      .w_data_size_i    ( rvfi_mem_size    [w] ),
+      .w_data_addr_i    ( rvfi_mem_addr    [w] ),
+      .w_data_wdata_i   ( rvfi_mem_wdata   [w] ),
+      .w_data_rdata_i   ( rvfi_mem_rdata   [w] ),
+      .w_current_pc_i   ( rvfi_current_pc  [w] ),
+      .w_next_pc_i      ( rvfi_next_pc     [w] ),
+      .w_valid_i        ( rvfi_valid       [w] ),
+      .w_intr_i         ( rvfi_intr        [w] ),
+      .w_trap_i         ( rvfi_trap        [w] ),
+      .rvfi_valid_o     ( rvfi_valid_o         ),
+      .rvfi_order_o     ( rvfi_order_o         ),
+      .rvfi_insn_o      ( rvfi_insn_o          ),
+      .rvfi_trap_o      ( rvfi_trap_o          ),
+      .rvfi_halt_o      ( rvfi_halt_o          ),
+      .rvfi_intr_o      ( rvfi_intr_o          ),
+      .rvfi_mode_o      ( rvfi_mode_o          ),
+      .rvfi_ixl_o       ( rvfi_ixl_o           ),
+      .rvfi_rs1_addr_o  ( rvfi_rs1_addr_o      ),
+      .rvfi_rs2_addr_o  ( rvfi_rs2_addr_o      ),
+      .rvfi_rs1_rdata_o ( rvfi_rs1_rdata_o     ),
+      .rvfi_rs2_rdata_o ( rvfi_rs2_rdata_o     ),
+      .rvfi_rd_addr_o   ( rvfi_rd_addr_o       ),
+      .rvfi_rd_wdata_o  ( rvfi_rd_wdata_o      ),
+      .rvfi_pc_rdata_o  ( rvfi_pc_rdata_o      ),
+      .rvfi_pc_wdata_o  ( rvfi_pc_wdata_o      ),
+      .rvfi_mem_addr_o  ( rvfi_mem_addr_o      ),
+      .rvfi_mem_rmask_o ( rvfi_mem_rmask_o     ),
+      .rvfi_mem_wmask_o ( rvfi_mem_wmask_o     ),
+      .rvfi_mem_rdata_o ( rvfi_mem_rdata_o     ),
+      .rvfi_mem_wdata_o ( rvfi_mem_wdata_o     )
+    );
+
+  end
+  else begin
+    assign rvfi_valid_o     = '0;
+    assign rvfi_order_o     = '0;
+    assign rvfi_insn_o      = '0;
+    assign rvfi_trap_o      = '0;
+    assign rvfi_halt_o      = '0;
+    assign rvfi_intr_o      = '0;
+    assign rvfi_mode_o      = '0;
+    assign rvfi_ixl_o       = '0;
+    assign rvfi_rs1_addr_o  = '0;
+    assign rvfi_rs2_addr_o  = '0;
+    assign rvfi_rs1_rdata_o = '0;
+    assign rvfi_rs2_rdata_o = '0;
+    assign rvfi_rd_addr_o   = '0;
+    assign rvfi_rd_wdata_o  = '0;
+    assign rvfi_pc_rdata_o  = '0;
+    assign rvfi_pc_wdata_o  = '0;
+    assign rvfi_mem_addr_o  = '0;
+    assign rvfi_mem_rmask_o = '0;
+    assign rvfi_mem_wmask_o = '0;
+    assign rvfi_mem_rdata_o = '0;
+    assign rvfi_mem_wdata_o = '0;
+  end
+
+endmodule
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_rvfi_controller
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+  import miriscv_gpr_pkg::GPR_ADDR_W;
+  import miriscv_decode_pkg::*;
+  import miriscv_lsu_pkg::*;
+(
+  input  logic                    clk_i,
+  input  logic                    aresetn_i,
+  input  logic [ILEN-1:0]         w_instr_i,
+
+  input  logic [GPR_ADDR_W-1:0]   w_rs1_addr_i,
+  input  logic [GPR_ADDR_W-1:0]   w_rs2_addr_i,
+  input  logic                    w_op1_gpr_i,
+  input  logic                    w_op2_gpr_i,
+  input  logic [XLEN-1:0]         w_rs1_rdata_i,
+  input  logic [XLEN-1:0]         w_rs2_rdata_i,
+  input  logic [GPR_ADDR_W-1:0]   w_wb_rd_addr_i,
+  input  logic [XLEN-1:0]         w_wb_data_i,
+  input  logic                    w_wb_we_i,
+  input  logic                    w_data_we_i,
+  input  logic                    w_data_req_i,
+  input  logic [MEM_ACCESS_W-1:0] w_data_size_i,
+  input  logic [XLEN-1:0]         w_data_addr_i,
+  input  logic [XLEN-1:0]         w_data_wdata_i,
+  input  logic [XLEN-1:0]         w_data_rdata_i,
+
+  input  logic [XLEN-1:0]         w_current_pc_i,
+  input  logic [XLEN-1:0]         w_next_pc_i,
+  input  logic                    w_valid_i,
+  input  logic                    w_intr_i,
+
+  input  logic                    w_trap_i,
+
+  output logic                    rvfi_valid_o,
+  output logic [63:0]             rvfi_order_o,
+  output logic [31:0]             rvfi_insn_o,
+  output logic                    rvfi_trap_o,
+  output logic                    rvfi_halt_o,
+  output logic                    rvfi_intr_o,
+  output logic [ 1:0]             rvfi_mode_o,
+  output logic [ 1:0]             rvfi_ixl_o,
+  output logic [ 4:0]             rvfi_rs1_addr_o,
+  output logic [ 4:0]             rvfi_rs2_addr_o,
+  output logic [31:0]             rvfi_rs1_rdata_o,
+  output logic [31:0]             rvfi_rs2_rdata_o,
+  output logic [ 4:0]             rvfi_rd_addr_o,
+  output logic [31:0]             rvfi_rd_wdata_o,
+  output logic [31:0]             rvfi_pc_rdata_o,
+  output logic [31:0]             rvfi_pc_wdata_o,
+  output logic [31:0]             rvfi_mem_addr_o,
+  output logic [ 3:0]             rvfi_mem_rmask_o,
+  output logic [ 3:0]             rvfi_mem_wmask_o,
+  output logic [31:0]             rvfi_mem_rdata_o,
+  output logic [31:0]             rvfi_mem_wdata_o
+);
+
+
+  assign rvfi_mode_o = 2'd3; // <- Machine mode
+  assign rvfi_ixl_o  = 2'd1;
+  assign rvfi_halt_o = 1'b0;
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_rs1_addr_o  <= '0;
+      rvfi_rs1_rdata_o <= '0;
+    end
+    else begin
+      if (w_op1_gpr_i) begin
+        rvfi_rs1_addr_o  <= w_rs1_addr_i;
+        rvfi_rs1_rdata_o <= w_rs1_rdata_i;
+      end
+      else begin
+        rvfi_rs1_addr_o  <= '0;
+        rvfi_rs1_rdata_o <= '0;
+      end
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_rs2_addr_o  <= '0;
+      rvfi_rs2_rdata_o <= '0;
+    end
+    else begin
+      if (w_op2_gpr_i) begin
+        rvfi_rs2_addr_o  <= w_rs2_addr_i;
+        rvfi_rs2_rdata_o <= w_rs2_rdata_i;
+      end
+      else begin
+        rvfi_rs2_addr_o  <= '0;
+        rvfi_rs2_rdata_o <= '0;
+      end
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_rd_addr_o  <= '0;
+      rvfi_rd_wdata_o <= '0;
+    end
+    else begin
+      if (w_wb_we_i) begin
+        rvfi_rd_addr_o  <= w_wb_rd_addr_i;
+        if (w_wb_rd_addr_i == 0) begin
+          rvfi_rd_wdata_o <=  '0;
+        end
+        else begin
+          rvfi_rd_wdata_o <=  w_wb_data_i;
+        end
+      end
+      else begin
+        rvfi_rd_addr_o  <= '0;
+        rvfi_rd_wdata_o <= '0;
+      end
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_insn_o <= '0;
+    end
+    else begin
+      rvfi_insn_o <= w_instr_i;
+    end
+  end
+
+  logic [3:0] w_data_mask;
+  always_comb begin
+    if (w_data_size_i == MEM_ACCESS_WORD) begin
+      w_data_mask = 4'b1111;
+    end
+    else if (w_data_size_i == MEM_ACCESS_HALF ||
+             w_data_size_i == MEM_ACCESS_UHALF) begin
+      w_data_mask = 4'b0011;
+    end
+    else if (w_data_size_i == MEM_ACCESS_BYTE ||
+             w_data_size_i == MEM_ACCESS_UBYTE) begin
+      w_data_mask = 4'b0001;
+    end
+    else begin
+      w_data_mask = 'bx;
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_mem_addr_o  <= '0;
+      rvfi_mem_rmask_o <= '0;
+      rvfi_mem_wmask_o <= '0;
+      rvfi_mem_rdata_o <= '0;
+      rvfi_mem_wdata_o <= '0;
+    end
+    else begin
+      if (w_data_req_i) begin
+        rvfi_mem_addr_o  <= w_data_addr_i;
+        rvfi_mem_wmask_o <= '0;
+        rvfi_mem_wdata_o <= '0;
+        rvfi_mem_rmask_o <= '0;
+        rvfi_mem_rdata_o <= '0;
+        if (w_data_we_i) begin
+          rvfi_mem_wmask_o <= w_data_mask;
+          rvfi_mem_wdata_o <= w_data_wdata_i;
+        end
+        else begin
+          rvfi_mem_rmask_o <= w_data_mask;
+          rvfi_mem_rdata_o <= w_data_rdata_i;
+        end
+      end
+      else begin
+        rvfi_mem_addr_o  <= '0;
+        rvfi_mem_rmask_o <= '0;
+        rvfi_mem_wmask_o <= '0;
+        rvfi_mem_rdata_o <= '0;
+        rvfi_mem_wdata_o <= '0;
+      end
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_valid_o <= '0;
+      rvfi_order_o <= '0;
+    end
+    else begin
+      rvfi_valid_o <= w_valid_i;
+      rvfi_order_o <= rvfi_order_o + rvfi_valid_o;
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_pc_rdata_o <= '0;
+      rvfi_pc_wdata_o <= '0;
+    end
+    else begin
+      rvfi_pc_rdata_o <= w_current_pc_i;
+      rvfi_pc_wdata_o <= w_next_pc_i;
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_trap_o <= '0;
+    end
+    else begin
+      rvfi_trap_o <= w_trap_i;
+    end
+  end
+
+  always_ff @(posedge clk_i, negedge aresetn_i) begin
+    if (~aresetn_i) begin
+      rvfi_intr_o <= '0;
+    end
+    else begin
+      rvfi_intr_o <= w_intr_i;
+    end
+  end
+
+endmodule
+
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_mdu
+  import miriscv_pkg::XLEN;
+  import miriscv_mdu_pkg::*;
+(
+  // Clock, reset
+  input  logic                clk_i,
+  input  logic                arstn_i,
+
+  // Core pipeline signals
+  input  logic                mdu_req_i,        // request for proceeding operation
+  input  logic [XLEN-1:0]     mdu_port_a_i,     // operand A
+  input  logic [XLEN-1:0]     mdu_port_b_i,     // operand B
+  input  logic [MDU_OP_W-1:0] mdu_op_i,         // opcode
+  input  logic                mdu_kill_i,       // cancel a current multicycle operation
+  input  logic                mdu_keep_i,       // save the result and prevent repetition of computation
+  output logic [XLEN-1:0]     mdu_result_o,     // computation result
+  output logic                mdu_stall_req_o   // stall the pipeline during a multicycle operation
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic                     sign_a;
+  logic                     sign_b;
+  logic                     msb_a;
+  logic                     msb_b;
+  logic                     b_is_zero;
+  logic                     mult_op;
+
+  logic signed [XLEN:0]     mul_operand_a;
+  logic signed [XLEN:0]     mul_operand_b;
+  logic signed [2*XLEN+1:0] mult_result_full;
+  logic        [2*XLEN-1:0] mult_result;
+
+  logic        [XLEN-1:0]   div_result;
+  logic signed [XLEN-1:0]   rem_result;
+  logic                     div_start;
+  logic                     div_stall;
+
+  logic                     mult_stall;
+  logic                     b_zero_flag_ff;
+
+  ////////////////////////////////////
+  // Sign extention for multipliers //
+  ////////////////////////////////////
+
+  assign sign_a = mdu_port_a_i[XLEN-1];
+  assign sign_b = mdu_port_b_i[XLEN-1];
+
+  // used for both MUL and DIV
+  assign b_is_zero = ~|mdu_port_b_i;
+
+  always_comb begin
+    case (mdu_op_i)
+      MDU_MUL,
+      MDU_MULH,
+      MDU_MULHU,
+      MDU_MULHSU:
+        mult_op = 1'b1;
+      MDU_DIV,
+      MDU_REM,
+      MDU_DIVU,
+      MDU_REMU:
+        mult_op = 1'b0;
+      default:
+        mult_op = 1'b0;
+    endcase
+  end
+
+  assign mul_operand_a = {msb_a, mdu_port_a_i};
+  assign mul_operand_b = {msb_b, mdu_port_b_i};
+
+  always_comb begin
+    case (mdu_op_i)
+      MDU_MUL,
+      MDU_MULH: begin
+        msb_a = sign_a;
+        msb_b = sign_b;
+      end
+      MDU_MULHU: begin
+        msb_a = 1'b0;
+        msb_b = 1'b0;
+      end
+      MDU_MULHSU: begin
+        msb_a = sign_a;
+        msb_b = 1'b0;
+      end
+      default: begin
+        msb_a = 1'b0;
+        msb_b = 1'b0;
+      end
+    endcase
+  end
+
+
+  ////////////////////
+  // Multiplication //
+  ////////////////////
+
+  assign mult_stall = 1'b0;
+
+  assign mult_result_full = mul_operand_a * mul_operand_b;
+  assign mult_result = mult_result_full[2*XLEN-1:0];
+
+
+  //////////////
+  // Division //
+  //////////////
+
+  assign div_start = !mult_op && mdu_req_i;
+
+  always_ff @(posedge clk_i or negedge arstn_i) begin
+    if (~arstn_i) begin
+      b_zero_flag_ff <= 1'b0;
+    end
+    else begin
+      b_zero_flag_ff <= b_is_zero;
+    end
+  end
+
+  miriscv_div
+  #(
+    .DIV_IMPLEMENTATION( "GENERIC" )
+  )
+  i_div_unit
+  (
+    .clk_i           ( clk_i          ),
+    .arstn_i         ( arstn_i        ),
+    .div_start_i     ( div_start      ),
+    .port_a_i        ( mdu_port_a_i   ),
+    .port_b_i        ( mdu_port_b_i   ),
+    .mdu_op_i        ( mdu_op_i       ),
+    .zero_i          ( b_zero_flag_ff ),
+    .kill_i          ( mdu_kill_i     ),
+    .keep_i          ( mdu_keep_i     ),
+    .div_result_o    ( div_result     ),
+    .rem_result_o    ( rem_result     ),
+    .div_stall_req_o ( div_stall      )
+  );
+
+
+  assign mdu_stall_req_o = div_stall || mult_stall;
+
+  always_comb begin
+    case (mdu_op_i)
+      MDU_MUL:    mdu_result_o = mult_result[XLEN-1:0];
+      MDU_MULH,
+      MDU_MULHSU,
+      MDU_MULHU:  mdu_result_o = mult_result[2*XLEN-1:XLEN];
+      MDU_DIV,
+      MDU_DIVU:   mdu_result_o = div_result;
+      MDU_REM,
+      MDU_REMU:   mdu_result_o = rem_result;
+      default:    mdu_result_o = {XLEN{1'b0}};
+    endcase
+
+  end
+
+endmodule
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_fetch_unit
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+(
+  // Clock, reset
+  input  logic            clk_i,
+  input  logic            arstn_i,
+
+  // Instruction memory interface
+  input  logic            instr_rvalid_i,
+  input  logic [XLEN-1:0] instr_rdata_i,
+  output logic            instr_req_o,
+  output logic [XLEN-1:0] instr_addr_o,
+
+  // Core pipeline signals
+  input  logic            cu_stall_f_i,
+  input  logic            cu_force_f_i,
+  input  logic [XLEN-1:0] cu_force_pc_i,
+
+
+  output logic [XLEN-1:0] fetched_pc_addr_o,
+  output logic [XLEN-1:0] fetched_pc_next_addr_o,
+  output logic [ILEN-1:0] instr_o,
+  output logic            fetch_rvalid_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+  logic [XLEN-1:0] pc_ff;
+  logic [XLEN-1:0] pc_next;
+  logic [XLEN-1:0] pc_plus_inc;
+  logic            fetch_en;
+
+
+  //////////////////
+  // Fetch logics //
+  //////////////////
+
+  assign fetch_en = fetch_rvalid_o | cu_force_f_i;
+
+  assign pc_plus_inc = pc_ff + 'd4;
+
+  assign pc_next     = cu_force_f_i ? cu_force_pc_i
+                                    : pc_plus_inc;
+
+  always_ff @(posedge clk_i or negedge arstn_i) begin
+    if (~arstn_i) begin
+      pc_ff <= {XLEN{1'b0}};
+    end
+    else if (fetch_en) begin
+      pc_ff <= pc_next;
+    end
+  end
+
+
+  assign instr_req_o  = ~cu_stall_f_i & ~instr_rvalid_i & ~cu_force_f_i;
+  assign instr_addr_o = pc_ff;
+
+  assign fetched_pc_addr_o       = pc_ff;
+  assign fetched_pc_next_addr_o  = pc_plus_inc;
+  assign instr_o                 = instr_rdata_i;
+  assign fetch_rvalid_o          = instr_rvalid_i & ~cu_force_f_i & ~cu_stall_f_i;
+
+endmodule
+
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_fetch_stage
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+#(
+  parameter bit RVFI = 1'b0
+) (
+  // Clock, reset
+  input  logic            clk_i,
+  input  logic            arstn_i,
+
+  // Control Unit
+  input  logic            cu_kill_f_i,
+  input  logic            cu_stall_f_i,
+  input  logic            cu_force_f_i,
+  input  logic [XLEN-1:0] cu_force_pc_i,
+  output logic            f_stall_req_o,
+
+  // Instruction memory interface
+  input  logic            instr_rvalid_i,
+  input  logic [XLEN-1:0] instr_rdata_i,
+  output logic            instr_req_o,
+  output logic [XLEN-1:0] instr_addr_o,
+
+  // To Decode
+  output logic [ILEN-1:0] f_instr_o,
+  output logic [XLEN-1:0] f_current_pc_o,
+  output logic [XLEN-1:0] f_next_pc_o,
+  output logic            f_valid_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic [ILEN-1:0] fetch_instr;
+  logic [XLEN-1:0] f_current_pc;
+  logic [XLEN-1:0] f_next_pc;
+  logic            fetch_instr_valid;
+
+  logic [ILEN-1:0] f_instr_ff;
+  logic [XLEN-1:0] f_current_pc_ff;
+  logic [XLEN-1:0] f_next_pc_ff;
+  logic            f_valid_ff;
+
+
+  ////////////////
+  // Fetch unit //
+  ////////////////
+
+  miriscv_fetch_unit
+  i_fetch_unit
+  (
+    .clk_i                  ( clk_i             ),
+    .arstn_i                ( arstn_i           ),
+
+    .instr_rvalid_i         ( instr_rvalid_i    ),
+    .instr_rdata_i          ( instr_rdata_i     ),
+    .instr_req_o            ( instr_req_o       ),
+    .instr_addr_o           ( instr_addr_o      ),
+
+    .cu_stall_f_i           ( cu_stall_f_i      ),
+    .cu_force_f_i           ( cu_force_f_i      ),
+    .cu_force_pc_i          ( cu_force_pc_i     ),
+
+    .fetched_pc_addr_o      ( f_current_pc      ),
+    .fetched_pc_next_addr_o ( f_next_pc         ),
+    .instr_o                ( fetch_instr       ),
+    .fetch_rvalid_o         ( fetch_instr_valid )
+  );
+
+
+  ///////////////////////
+  // Pipeline register //
+  ///////////////////////
+
+  always_ff @(posedge clk_i or negedge arstn_i) begin
+    if(~arstn_i)
+      f_valid_ff <= '0;
+    else if (cu_kill_f_i)
+      f_valid_ff <= '0;
+    else if (~cu_stall_f_i)
+      f_valid_ff <= fetch_instr_valid;
+  end
+
+  always_ff @(posedge clk_i) begin
+    if (~cu_stall_f_i) begin
+      f_instr_ff      <= fetch_instr;
+      f_current_pc_ff <= f_current_pc;
+      f_next_pc_ff    <= f_next_pc;
+    end
+  end
+
+  assign f_instr_o      = f_instr_ff;
+  assign f_current_pc_o = f_current_pc_ff;
+  assign f_next_pc_o    = f_next_pc_ff;
+  assign f_valid_o      = f_valid_ff;
+
+  assign f_stall_req_o  = '0;
+
+endmodule
+
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_decode_stage
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+  import miriscv_gpr_pkg::GPR_ADDR_W;
+  import miriscv_alu_pkg::ALU_OP_W;
+  import miriscv_mdu_pkg::MDU_OP_W;
+  import miriscv_lsu_pkg::MEM_ACCESS_W;
+  import miriscv_decode_pkg::*;
+#(
+  parameter bit RVFI = 1'b0
+) (
+  // Clock, reset
+  input  logic                    clk_i,
+  input  logic                    arstn_i,
+
+  // Control unit
+  input  logic                    cu_kill_d_i,
+  input  logic                    cu_stall_d_i,
+  input  logic                    cu_stall_f_i,
+  output logic                    d_stall_req_o,
+
+  // From Fetch
+  input  logic [ILEN-1:0]         f_instr_i,
+  input  logic [XLEN-1:0]         f_current_pc_i,
+  input  logic [XLEN-1:0]         f_next_pc_i,
+  input  logic                    f_valid_i,
+
+  input  logic                    m_gpr_wr_en_i,
+  input  logic [XLEN-1:0]         m_gpr_wr_data_i,
+  input  logic [GPR_ADDR_W-1:0]   m_gpr_wr_addr_i,
+
+  output logic                    d_valid_o,
+
+  output logic [XLEN-1:0]         d_op1_o,
+  output logic [XLEN-1:0]         d_op2_o,
+
+  output logic [ALU_OP_W-1:0]     d_alu_operation_o,
+  output logic                    d_mdu_req_o,
+  output logic [MDU_OP_W-1:0]     d_mdu_operation_o,
+
+  output logic                    d_mem_req_o,
+
+  output logic                    d_mem_we_o,
+  output logic [MEM_ACCESS_W-1:0] d_mem_size_o,
+  output logic [XLEN-1:0]         d_mem_addr_o,
+  output logic [XLEN-1:0]         d_mem_data_o,
+
+  output logic                    d_gpr_wr_en_o,
+  output logic [GPR_ADDR_W-1:0]   d_gpr_wr_addr_o,
+  output logic [WB_SRC_W-1:0]     d_gpr_src_sel_o,
+
+  output logic                    d_branch_o,
+  output logic                    d_jal_o,
+  output logic                    d_jalr_o,
+  output logic [XLEN-1:0]         d_target_pc_o,
+  output logic [XLEN-1:0]         d_next_pc_o,
+  output logic                    d_prediction_o,
+  output logic                    d_br_j_taken_o,
+
+  output logic [GPR_ADDR_W-1:0]   f_cu_rs1_addr_o,
+  output logic                    f_cu_rs1_req_o,
+  output logic [GPR_ADDR_W-1:0]   f_cu_rs2_addr_o,
+  output logic                    f_cu_rs2_req_o,
+
+  // RVFI
+  output logic                    d_rvfi_wb_we_o,
+  output logic [GPR_ADDR_W-1:0]   d_rvfi_wb_rd_addr_o,
+  output logic [ILEN-1:0]         d_rvfi_instr_o,
+  output logic [GPR_ADDR_W-1:0]   d_rvfi_rs1_addr_o,
+  output logic [GPR_ADDR_W-1:0]   d_rvfi_rs2_addr_o,
+  output logic                    d_rvfi_op1_gpr_o,
+  output logic                    d_rvfi_op2_gpr_o,
+  output logic [XLEN-1:0]         d_rvfi_rs1_rdata_o,
+  output logic [XLEN-1:0]         d_rvfi_rs2_rdata_o,
+  output logic [XLEN-1:0]         d_rvfi_current_pc_o,
+  output logic [XLEN-1:0]         d_rvfi_next_pc_o,
+  output logic                    d_rvfi_valid_o,
+  output logic                    d_rvfi_trap_o,
+  output logic                    d_rvfi_intr_o,
+  output logic                    d_rvfi_mem_req_o,
+  output logic                    d_rvfi_mem_we_o,
+  output logic [MEM_ACCESS_W-1:0] d_rvfi_mem_size_o,
+  output logic [XLEN-1:0]         d_rvfi_mem_addr_o,
+  output logic [XLEN-1:0]         d_rvfi_mem_wdata_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic                    decode_rs1_re;
+  logic                    decode_rs2_re;
+
+  logic [OP1_SEL_W-1:0]    decode_ex_op1_sel;
+  logic [OP2_SEL_W-1:0]    decode_ex_op2_sel;
+
+  logic [ALU_OP_W-1:0]     decode_alu_operation;
+  logic [MDU_OP_W-1:0]     decode_mdu_operation;
+
+  logic                    decode_ex_mdu_req;
+  logic                    decode_ex_result_sel;
+
+  logic                    decode_mem_we;
+  logic [MEM_ACCESS_W-1:0] decode_mem_size;
+  logic                    decode_mem_req;
+
+  logic [WB_SRC_W-1:0]     decode_wb_src_sel;
+  logic                    decode_wb_we;
+
+  logic [XLEN-1:0]         decode_mem_addr_imm;
+  logic [XLEN-1:0]         decode_mem_addr;
+  logic [XLEN-1:0]         decode_mem_data;
+  logic                    decode_load;
+
+  logic                    d_illegal_instr;
+
+  logic                    d_ebreak;
+  logic                    d_ecall;
+  logic                    d_mret;
+  logic                    d_fence;
+  logic                    d_branch;
+  logic                    d_jal;
+  logic                    d_jalr;
+
+  logic [GPR_ADDR_W-1:0]   r1_addr;
+  logic [XLEN-1:0]         r1_data;
+  logic [GPR_ADDR_W-1:0]   r2_addr;
+  logic [XLEN-1:0]         r2_data;
+  logic [GPR_ADDR_W-1:0]   rd_addr;
+
+  logic                    gpr_wr_en;
+  logic [GPR_ADDR_W-1:0]   gpr_wr_addr;
+  logic [XLEN-1:0]         gpr_wr_data;
+
+  logic [XLEN-1:0]         imm_i;
+  logic [XLEN-1:0]         imm_u;
+  logic [XLEN-1:0]         imm_s;
+  logic [XLEN-1:0]         imm_b;
+  logic [XLEN-1:0]         imm_j;
+
+  logic [XLEN-1:0]         op1;
+  logic [XLEN-1:0]         op2;
+
+  logic [XLEN-1:0]         jalr_pc;
+  logic [XLEN-1:0]         branch_pc;
+  logic [XLEN-1:0]         jal_pc;
+
+  logic [XLEN-1:0]         d_target_pc;
+  logic                    f_handshake;
+
+  logic                    d_valid_ff;
+
+  logic [XLEN-1:0]         d_op1_ff;
+  logic [XLEN-1:0]         d_op2_ff;
+
+  logic [ALU_OP_W-1:0]     d_alu_operation_ff;
+  logic                    d_mdu_req_ff;
+  logic [MDU_OP_W-1:0]     d_mdu_operation_ff;
+
+  logic                    d_mem_req_ff;
+
+  logic                    d_mem_we_ff;
+  logic [MEM_ACCESS_W-1:0] d_mem_size_ff;
+  logic [XLEN-1:0]         d_mem_addr_ff;
+  logic [XLEN-1:0]         d_mem_data_ff;
+
+  logic                    d_gpr_wr_en_ff;
+  logic [GPR_ADDR_W-1:0]   d_gpr_wr_addr_ff;
+  logic [WB_SRC_W-1:0]     d_gpr_src_sel_ff;
+
+  logic                    d_branch_ff;
+  logic                    d_jal_ff;
+  logic                    d_jalr_ff;
+  logic [XLEN-1:0]         d_target_pc_ff;
+  logic [XLEN-1:0]         d_next_pc_ff;
+  logic                    d_prediction_ff;
+  logic                    d_br_j_taken_ff;
+
+  enum logic [3:0] {
+    PC_INCR,
+    PC_JAL,
+    PC_JALR,
+    PC_BRANCH,
+    PC_MRET,
+    PC_ECALL,
+    PC_FENCE,
+    PC_WFI,
+    PC_IRQ,
+    PC_EXCEPT
+  } next_pc_sel;
+
+
+  /////////////
+  // Decoder //
+  /////////////
+
+  miriscv_decoder
+  i_decoder
+  (
+    .decode_instr_i         ( f_instr_i            ),
+
+    .decode_rs1_re_o        ( decode_rs1_re        ),
+    .decode_rs2_re_o        ( decode_rs2_re        ),
+
+    .decode_ex_op1_sel_o    ( decode_ex_op1_sel    ),
+    .decode_ex_op2_sel_o    ( decode_ex_op2_sel    ),
+
+    .decode_alu_operation_o ( decode_alu_operation ),
+
+    .decode_mdu_operation_o ( decode_mdu_operation ),
+    .decode_ex_mdu_req_o    ( decode_ex_mdu_req    ),
+
+    .decode_mem_we_o        ( decode_mem_we        ),
+    .decode_mem_size_o      ( decode_mem_size      ),
+    .decode_mem_req_o       ( decode_mem_req       ),
+
+    .decode_wb_src_sel_o    ( decode_wb_src_sel    ),
+    .decode_wb_we_o         ( decode_wb_we         ),
+
+    .decode_fence_o         ( d_fence              ),
+    .decode_branch_o        ( d_branch             ),
+    .decode_jal_o           ( d_jal                ),
+    .decode_jalr_o          ( d_jalr               ),
+    .decode_load_o          ( decode_load          ),
+
+    .decode_illegal_instr_o ( d_illegal_instr      )
+  );
+
+
+  ///////////////////
+  // Register File //
+  ///////////////////
+
+  assign gpr_wr_en   = m_gpr_wr_en_i;
+  assign gpr_wr_addr = m_gpr_wr_addr_i;
+  assign gpr_wr_data = m_gpr_wr_data_i;
+
+  assign r1_addr = f_instr_i[19:15];
+  assign r2_addr = f_instr_i[24:20];
+  assign rd_addr = f_instr_i[11:7];
+
+
+  miriscv_gpr
+  i_gpr
+  (
+    .clk_i      ( clk_i       ),
+    .arstn_i    ( arstn_i     ),
+
+    .wr_en_i    ( gpr_wr_en   ),
+    .wr_addr_i  ( gpr_wr_addr ),
+    .wr_data_i  ( gpr_wr_data ),
+
+    .r1_addr_i  ( r1_addr     ),
+    .r1_data_o  ( r1_data     ),
+    .r2_addr_i  ( r2_addr     ),
+    .r2_data_o  ( r2_data     )
+  );
+
+
+  //////////////////////////////
+  // Immediate and signextend //
+  //////////////////////////////
+
+  miriscv_signextend
+  #(
+    .IN_WIDTH  ( 12   ),
+    .OUT_WIDTH ( XLEN )
+  )
+  extend_imm_i
+  (
+    .data_i ( f_instr_i[31:20] ),
+    .data_o ( imm_i            )
+  );
+
+  assign imm_u = {f_instr_i[31:12], 12'd0};
+
+  miriscv_signextend
+  #(
+    .IN_WIDTH  ( 12   ),
+    .OUT_WIDTH ( XLEN )
+  )
+  extend_imm_s
+  (
+    .data_i ( {f_instr_i[31:25], f_instr_i[11:7]} ),
+    .data_o ( imm_s                               )
+  );
+
+  miriscv_signextend
+  #(
+    .IN_WIDTH  ( 13   ),
+    .OUT_WIDTH ( XLEN )
+  )
+  extend_imm_b
+  (
+    .data_i ( {f_instr_i[31], f_instr_i[7], f_instr_i[30:25], f_instr_i[11:8], 1'b0} ),
+    .data_o ( imm_b                                                                  )
+  );
+
+  miriscv_signextend
+  #(
+    .IN_WIDTH  ( 21   ),
+    .OUT_WIDTH ( XLEN )
+  )
+  extend_imm_j
+  (
+    .data_i ( {f_instr_i[31], f_instr_i[19:12], f_instr_i[20], f_instr_i[30:21], 1'b0} ),
+    .data_o ( imm_j                                                                    )
+  );
+
+
+  //////////////
+  // Datapath //
+  //////////////
+
+  always_comb begin
+    unique case (decode_ex_op1_sel)
+      RS1_DATA:   op1 = r1_data;
+      CURRENT_PC: op1 = f_current_pc_i;
+      ZERO:       op1 = {XLEN{1'b0}};
+    endcase
+  end
+
+  always_comb begin
+    unique case (decode_ex_op2_sel)
+      RS2_DATA: op2 = r2_data;
+      IMM_I:    op2 = imm_i;
+      IMM_U:    op2 = imm_u;
+      NEXT_PC:  op2 = f_next_pc_i;
+    endcase
+  end
+
+  assign decode_mem_data     = op2;
+  assign decode_mem_addr_imm = decode_load ? imm_i : imm_s;
+  assign decode_mem_addr     = op1 + decode_mem_addr_imm;
+
+
+  // precompute PC values in case of jump
+  assign jalr_pc   = (op1 + imm_i) & (~'b1);
+  assign branch_pc = f_current_pc_i  + imm_b;
+  assign jal_pc    = f_current_pc_i  + imm_j;
+
+  always_comb begin
+    case ({d_branch, d_jalr, d_jal}) inside
+      3'b100:  next_pc_sel = PC_BRANCH;
+      3'b010:  next_pc_sel = PC_JALR;
+      3'b001:  next_pc_sel = PC_JAL;
+      default: next_pc_sel = PC_INCR;
+    endcase
+  end
+
+  always_comb begin
+    case (next_pc_sel)
+      PC_JAL:    d_target_pc = jal_pc;
+      PC_JALR:   d_target_pc = jalr_pc;
+      PC_BRANCH: d_target_pc = branch_pc;
+      default:   d_target_pc = branch_pc; // any value can be placed here
+    endcase
+  end
+
+
+  ///////////////////////
+  // Pipeline register //
+  ///////////////////////
+
+  assign f_handshake = f_valid_i & ~cu_stall_f_i;
+
+  always_ff @(posedge clk_i or negedge arstn_i) begin
+    if (~arstn_i)
+      d_valid_ff <= '0;
+    else if (cu_kill_d_i)
+      d_valid_ff <= '0;
+    else if (~cu_stall_d_i)
+      d_valid_ff <= f_handshake;
+  end
+
+
+  always_ff @(posedge clk_i) begin
+    if (f_handshake & ~cu_stall_d_i) begin
+      d_op1_ff           <= op1;
+      d_op2_ff           <= op2;
+
+      d_alu_operation_ff <= decode_alu_operation;
+      d_mdu_req_ff       <= decode_ex_mdu_req;
+      d_mdu_operation_ff <= decode_mdu_operation;
+
+      d_mem_req_ff       <= decode_mem_req;
+      d_mem_we_ff        <= decode_mem_we;
+      d_mem_size_ff      <= decode_mem_size;
+      d_mem_addr_ff      <= decode_mem_addr;
+      d_mem_data_ff      <= decode_mem_data;
+
+      d_gpr_wr_en_ff     <= decode_wb_we;
+      d_gpr_wr_addr_ff   <= rd_addr;
+      d_gpr_src_sel_ff   <= decode_wb_src_sel;
+
+      d_branch_ff        <= d_branch;
+      d_jal_ff           <= d_jal;
+      d_jalr_ff          <= d_jalr;
+      d_target_pc_ff     <= d_target_pc;
+      d_next_pc_ff       <= f_next_pc_i;
+      d_prediction_ff    <= '0; // All instructions are "predicted" as not taken
+      d_br_j_taken_ff    <= d_jal | d_jalr;
+
+    end
+  end
+
+  assign d_valid_o         = d_valid_ff;
+
+  assign d_op1_o           = d_op1_ff;
+  assign d_op2_o           = d_op2_ff;
+
+  assign d_alu_operation_o = d_alu_operation_ff;
+  assign d_mdu_req_o       = d_mdu_req_ff;
+  assign d_mdu_operation_o = d_mdu_operation_ff;
+
+  assign d_mem_req_o       = d_mem_req_ff;
+  assign d_mem_we_o        = d_mem_we_ff;
+  assign d_mem_size_o      = d_mem_size_ff;
+  assign d_mem_addr_o      = d_mem_addr_ff;
+  assign d_mem_data_o      = d_mem_data_ff;
+
+  assign d_gpr_wr_en_o     = d_gpr_wr_en_ff;
+  assign d_gpr_wr_addr_o   = d_gpr_wr_addr_ff;
+  assign d_gpr_src_sel_o   = d_gpr_src_sel_ff;
+
+  assign d_branch_o        = d_branch_ff;
+  assign d_jal_o           = d_jal_ff;
+  assign d_jalr_o          = d_jalr_ff;
+  assign d_target_pc_o     = d_target_pc_ff;
+  assign d_next_pc_o       = d_next_pc_ff;
+  assign d_prediction_o    = d_prediction_ff;
+  assign d_br_j_taken_o    = d_br_j_taken_ff;
+
+  assign d_stall_req_o     = '0;
+
+  assign f_cu_rs1_addr_o   = r1_addr;
+  assign f_cu_rs1_req_o    = decode_rs1_re;
+
+  assign f_cu_rs2_addr_o   = r2_addr;
+  assign f_cu_rs2_req_o    = decode_rs2_re;
+
+
+  ////////////////////
+  // RVFI interface //
+  ////////////////////
+
+  if (RVFI) begin
+    always_ff @(posedge clk_i or negedge arstn_i) begin
+      if(~arstn_i) begin
+        d_rvfi_wb_we_o          <= '0;
+        d_rvfi_wb_rd_addr_o     <= '0;
+        d_rvfi_instr_o          <= '0;
+        d_rvfi_rs1_addr_o       <= '0;
+        d_rvfi_rs2_addr_o       <= '0;
+        d_rvfi_op1_gpr_o        <= '0;
+        d_rvfi_op2_gpr_o        <= '0;
+        d_rvfi_rs1_rdata_o      <= '0;
+        d_rvfi_rs2_rdata_o      <= '0;
+        d_rvfi_current_pc_o     <= '0;
+        d_rvfi_next_pc_o        <= '0;
+        d_rvfi_valid_o          <= '0;
+        d_rvfi_trap_o           <= '0;
+        d_rvfi_intr_o           <= '0;
+        d_rvfi_mem_req_o        <= '0;
+        d_rvfi_mem_we_o         <= '0;
+        d_rvfi_mem_size_o       <= '0;
+        d_rvfi_mem_addr_o       <= '0;
+        d_rvfi_mem_wdata_o      <= '0;
+      end
+
+      else if (cu_kill_d_i) begin
+        d_rvfi_wb_we_o          <= '0;
+        d_rvfi_wb_rd_addr_o     <= '0;
+        d_rvfi_instr_o          <= '0;
+        d_rvfi_rs1_addr_o       <= '0;
+        d_rvfi_rs2_addr_o       <= '0;
+        d_rvfi_op1_gpr_o        <= '0;
+        d_rvfi_op2_gpr_o        <= '0;
+        d_rvfi_rs1_rdata_o      <= '0;
+        d_rvfi_rs2_rdata_o      <= '0;
+        d_rvfi_current_pc_o     <= '0;
+        d_rvfi_next_pc_o        <= '0;
+        d_rvfi_valid_o          <= '0;
+        d_rvfi_trap_o           <= '0;
+        d_rvfi_intr_o           <= '0;
+        d_rvfi_mem_req_o        <= '0;
+        d_rvfi_mem_we_o         <= '0;
+        d_rvfi_mem_size_o       <= '0;
+        d_rvfi_mem_addr_o       <= '0;
+        d_rvfi_mem_wdata_o      <= '0;
+      end
+
+      else if (~cu_stall_d_i) begin
+        d_rvfi_wb_we_o          <= decode_wb_we;
+        d_rvfi_wb_rd_addr_o     <= rd_addr;
+        d_rvfi_instr_o          <= f_instr_i;
+        d_rvfi_rs1_addr_o       <= r1_addr;
+        d_rvfi_rs2_addr_o       <= r2_addr;
+        d_rvfi_op1_gpr_o        <= decode_rs1_re;
+        d_rvfi_op2_gpr_o        <= decode_rs2_re;
+        d_rvfi_rs1_rdata_o      <= op1;
+        d_rvfi_rs2_rdata_o      <= op2;
+        d_rvfi_current_pc_o     <= f_current_pc_i;
+        d_rvfi_next_pc_o        <= f_next_pc_i;
+        d_rvfi_valid_o          <= f_handshake;
+        d_rvfi_trap_o           <= '0;
+        d_rvfi_intr_o           <= '0;
+        d_rvfi_mem_req_o        <= decode_mem_req;
+        d_rvfi_mem_we_o         <= decode_mem_we;
+        d_rvfi_mem_size_o       <= decode_mem_size;
+        d_rvfi_mem_addr_o       <= decode_mem_addr;
+        d_rvfi_mem_wdata_o      <= decode_mem_data;
+      end
+
+    end
+  end
+  else begin
+    assign d_rvfi_wb_we_o          = '0;
+    assign d_rvfi_wb_rd_addr_o     = '0;
+    assign d_rvfi_instr_o          = '0;
+    assign d_rvfi_rs1_addr_o       = '0;
+    assign d_rvfi_rs2_addr_o       = '0;
+    assign d_rvfi_op1_gpr_o        = '0;
+    assign d_rvfi_op2_gpr_o        = '0;
+    assign d_rvfi_rs1_rdata_o      = '0;
+    assign d_rvfi_rs2_rdata_o      = '0;
+    assign d_rvfi_current_pc_o     = '0;
+    assign d_rvfi_next_pc_o        = '0;
+    assign d_rvfi_valid_o          = '0;
+    assign d_rvfi_trap_o           = '0;
+    assign d_rvfi_intr_o           = '0;
+    assign d_rvfi_mem_req_o        = '0;
+    assign d_rvfi_mem_we_o         = '0;
+    assign d_rvfi_mem_size_o       = '0;
+    assign d_rvfi_mem_addr_o       = '0;
+    assign d_rvfi_mem_wdata_o      = '0;
+  end
+
+endmodule
+
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_div
+  import miriscv_pkg::XLEN;
+  import miriscv_mdu_pkg::*;
+#(
+  parameter DIV_IMPLEMENTATION = "GENERIC" // GENERIC or XILINX_7_SERIES
+) (
+  // Clock, reset
+  input  logic                clk_i,
+  input  logic                arstn_i,
+
+  // Div control
+  input  logic                div_start_i,
+  input  logic [XLEN-1:0]     port_a_i,
+  input  logic [XLEN-1:0]     port_b_i,
+  input  logic [MDU_OP_W-1:0] mdu_op_i,
+  input  logic                zero_i,
+  input  logic                kill_i,
+  input  logic                keep_i,
+
+  // Div results
+  output logic [XLEN-1:0]     div_result_o,
+  output logic [XLEN-1:0]     rem_result_o,
+  output logic                div_stall_req_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  enum logic [2:0] {DIV_IDLE, DIV_FIRST, DIV_COMP, DIV_LAST,
+                    DIV_SIGN_CHANGE, DIV_FINISH} d_state_ff, d_next_state;
+
+  logic        [XLEN-1:0]         div_result_ff;
+  logic signed [2*XLEN:0]         rem_result_ff;
+  logic        [XLEN-1:0]         div_operand_a_ff;
+  logic        [XLEN-1:0]         div_operand_b_ff;
+  logic                           sign_inv_ff;
+  logic        [$clog2(XLEN)-1:0] iter_ff;
+
+  logic                           sign_a;
+  logic                           sign_b;
+  logic                           div_done;
+
+  assign sign_a = port_a_i[XLEN-1];
+  assign sign_b = port_b_i[XLEN-1];
+
+  assign div_done = (d_state_ff == DIV_FINISH);
+  assign div_stall_req_o = (div_start_i && !div_done);
+
+
+  /////////////////////////
+  // Next state decision //
+  /////////////////////////
+
+  always_ff @(posedge clk_i) begin
+    if (~arstn_i) begin
+      d_state_ff <= DIV_IDLE;
+    end
+    else begin
+      if (kill_i)
+        d_state_ff <= DIV_IDLE;
+      else
+        d_state_ff <= d_next_state;
+    end
+  end
+
+  always_comb begin
+    case (d_state_ff)
+
+      DIV_IDLE: begin
+        if (div_start_i)
+          d_next_state = DIV_FIRST;
+        else
+          d_next_state = DIV_IDLE;
+      end
+
+      DIV_FIRST: begin
+        if (zero_i)
+          d_next_state = DIV_FINISH;
+        else
+          d_next_state = DIV_COMP;
+      end
+
+      DIV_COMP: begin
+        if (iter_ff == 'd1)
+          d_next_state = DIV_LAST;
+        else
+          d_next_state = DIV_COMP;
+      end
+
+      DIV_LAST: begin
+        if (sign_inv_ff) begin
+          d_next_state = DIV_SIGN_CHANGE;
+        end
+        else begin
+          d_next_state = DIV_FINISH;
+        end
+      end
+
+      DIV_SIGN_CHANGE: begin
+        d_next_state = DIV_FINISH;
+      end
+
+      DIV_FINISH: begin
+        if (~keep_i)
+          d_next_state = DIV_IDLE;
+        else
+          d_next_state = DIV_FINISH;
+      end
+
+      default: begin
+        d_next_state = DIV_IDLE;
+      end
+
+    endcase
+  end
+
+
+  ////////////////////////////
+  // Division state machine //
+  ////////////////////////////
+
+  generate
+    if (DIV_IMPLEMENTATION == "XILINX_7_SERIES") begin : dsp_div
+
+      logic        [6:0]  dsp48_opmode;
+      logic        [3:0]  dsp48_alumode;
+      logic signed [29:0] dsp48_A;
+      logic signed [17:0] dsp48_B;
+      logic signed [47:0] dsp48_C;
+      logic signed [47:0] dsp48_P;
+
+      localparam [1:0] OPMODE_X_AB_CONCAT = 2'b11;
+      localparam [1:0] OPMODE_Y_ZERO      = 2'b00;
+      localparam [2:0] OPMODE_Z_C         = 3'b011;
+      localparam [3:0] ALUMODE_SUM        = 4'b0000;
+      localparam [3:0] ALUMODE_INV_Z      = 4'b0001;
+      localparam [3:0] ALUMODE_SUB        = 4'b0011;
+
+      mrv1f_dsp48_wrapper
+      #(
+        .A_INPUT_SOURCE ( "DIRECT" ),
+        .B_INPUT_SOURCE ( "DIRECT" ),
+        .USE_MULT       ( "NONE"   ),
+        .A_REG          ( 2'b0     ),
+        .B_REG          ( 2'b0     ),
+        .P_REG          ( 1'b0     )
+      )
+      i_dsp48
+      (
+        .clk_i   ( clk_i         ),
+        .srstn_i ( arstn_i       ),
+        .enable  ( 1'b1          ),
+        .OPMODE  ( dsp48_opmode  ),
+        .ALUMODE ( dsp48_alumode ),
+        .A       ( dsp48_A       ),
+        .B       ( dsp48_B       ),
+        .C       ( dsp48_C       ),
+        .P       ( dsp48_P       )
+      );
+
+      assign dsp48_opmode[6:4] = OPMODE_Z_C;
+      assign dsp48_opmode[3:2] = OPMODE_Y_ZERO;
+      assign dsp48_opmode[1:0] = OPMODE_X_AB_CONCAT;
+
+      always_comb begin
+        case ({rem_result_ff[2*XLEN], d_state_ff}) inside
+          {1'b0, DIV_LAST},
+          {1'b?, DIV_SIGN_CHANGE}: dsp48_A = 'd0;
+          default:                 dsp48_A = {'0, div_operand_b_ff[XLEN-1:18]};
+        endcase
+
+        case ({rem_result_ff[2*XLEN], d_state_ff}) inside
+          {1'b0, DIV_LAST}:        dsp48_B = 'd0;
+          {1'b?, DIV_SIGN_CHANGE}: dsp48_B = 'd1;
+          default:                 dsp48_B = div_operand_b_ff[17:0];
+        endcase
+
+        case (d_state_ff)
+          DIV_FIRST: dsp48_C = div_operand_a_ff[XLEN-1];
+          DIV_COMP:  dsp48_C = rem_result_ff[2*XLEN-1:XLEN-1];
+          default:   dsp48_C = rem_result_ff[2*XLEN:XLEN];
+        endcase
+
+        case ({rem_result_ff[2*XLEN], d_state_ff}) inside
+          {1'b1, DIV_COMP},
+          {1'b1, DIV_LAST}:        dsp48_alumode = ALUMODE_SUM;
+          {1'b?, DIV_SIGN_CHANGE}: dsp48_alumode = ALUMODE_INV_Z;
+          default:                 dsp48_alumode = ALUMODE_SUB;
+        endcase
+      end
+
+      always_ff @(posedge clk_i) begin
+        if (~arstn_i) begin
+          div_result_ff    <= {XLEN{1'b0}};
+          rem_result_ff    <= {(2*XLEN+1){1'b0}};
+          div_operand_a_ff <= {(XLEN){1'b0}};
+          div_operand_b_ff <= {(XLEN){1'b0}};
+          sign_inv_ff      <= 1'b0;
+          iter_ff          <= {($clog2(XLEN)){1'b0}};
+        end
+        else begin
+          rem_result_ff[2*XLEN:XLEN] <= dsp48_P[XLEN:0];
+
+          case (d_state_ff)
+
+            DIV_IDLE: begin
+              case (mdu_op_i)
+                MDU_DIV,
+                MDU_REM:  begin
+                  div_operand_a_ff <= sign_a ? (~port_a_i + 'd1) : (port_a_i);
+                  div_operand_b_ff <= sign_b ? (~port_b_i + 'd1) : (port_b_i);
+                end
+                MDU_DIVU,
+                MDU_REMU: begin
+                  div_operand_a_ff <= port_a_i;
+                  div_operand_b_ff <= port_b_i;
+                end
+                default: ;
+              endcase
+
+              case (mdu_op_i)
+                MDU_DIV: sign_inv_ff <= (sign_a ^ sign_b);
+                MDU_REM: sign_inv_ff <= sign_a;
+                default: sign_inv_ff <= 1'b0;
+              endcase
+            end
+
+            DIV_FIRST: begin
+              iter_ff <= XLEN - 1;
+              if (zero_i) begin
+                div_result_ff <= '1;
+                rem_result_ff[2*XLEN-1:XLEN] <= port_a_i;
+              end
+              else begin
+                div_result_ff           <= {{(XLEN-1){~sign_inv_ff}}, 1'b1};
+                rem_result_ff[XLEN-1:0] <= {div_operand_a_ff[XLEN-2:0], 1'b0};
+              end
+            end
+
+            DIV_COMP,
+            DIV_LAST: begin
+              iter_ff <= iter_ff - 1;
+              rem_result_ff[XLEN-1:0] <= {rem_result_ff[XLEN-2:0], 1'b0};
+              div_result_ff[iter_ff]  <= !rem_result_ff[2*XLEN];
+            end
+
+            DIV_SIGN_CHANGE: begin
+              div_result_ff <= ~div_result_ff + 'd1;
+            end
+
+            default: ;
+          endcase
+        end
+      end
+
+    end
+    else if (DIV_IMPLEMENTATION == "GENERIC") begin
+
+      always_ff @(posedge clk_i) begin
+        if (~arstn_i) begin
+          div_result_ff    <= {XLEN{1'b0}};
+          rem_result_ff    <= {(2*XLEN+1){1'b0}};
+          div_operand_a_ff <= {(XLEN){1'b0}};
+          div_operand_b_ff <= {(XLEN){1'b0}};
+          sign_inv_ff      <= 1'b0;
+          iter_ff          <= {($clog2(XLEN)){1'b0}};
+        end
+        else begin
+          case (d_state_ff)
+
+            DIV_IDLE: begin
+              case (mdu_op_i)
+                MDU_DIV,
+                MDU_REM:  begin
+                  div_operand_a_ff <= sign_a ? (~port_a_i + 'd1) : port_a_i;
+                  div_operand_b_ff <= sign_b ? (~port_b_i + 'd1) : port_b_i;
+                end
+                MDU_DIVU,
+                MDU_REMU: begin
+                  div_operand_a_ff <= port_a_i;
+                  div_operand_b_ff <= port_b_i;
+                end
+                default: ;
+              endcase
+
+              case (mdu_op_i)
+                MDU_DIV: sign_inv_ff <= (sign_a ^ sign_b);
+                MDU_REM: sign_inv_ff <= sign_a;
+                default: sign_inv_ff <= 1'b0;
+              endcase
+            end
+
+            DIV_FIRST: begin
+              iter_ff <= XLEN - 'd1;
+              if (zero_i) begin
+                div_result_ff <= '1;
+                rem_result_ff[2*XLEN-1:XLEN] <= port_a_i;
+              end
+              else begin
+                div_result_ff <= {{(XLEN-1){~sign_inv_ff}}, 1'b1};
+                rem_result_ff[2*XLEN:XLEN] <= div_operand_a_ff[XLEN-1] - div_operand_b_ff[XLEN-1:0];
+                rem_result_ff[XLEN-1:0] <= {div_operand_a_ff[XLEN-2:0], 1'b0};
+              end
+            end
+
+            DIV_COMP: begin
+              iter_ff <= iter_ff - 'd1;
+              div_result_ff[iter_ff] <= !rem_result_ff[2*XLEN];
+              rem_result_ff[XLEN-1:0] <= {rem_result_ff[XLEN-2:0], 1'b0};
+              if (rem_result_ff[2*XLEN]) begin
+                rem_result_ff[2*XLEN:XLEN] <= rem_result_ff[2*XLEN-1:XLEN-1] + div_operand_b_ff[XLEN-1:0];
+              end
+              else begin
+                rem_result_ff[2*XLEN:XLEN] <= rem_result_ff[2*XLEN-1:XLEN-1] - div_operand_b_ff[XLEN-1:0];
+              end
+            end
+
+            DIV_LAST: begin
+              div_result_ff[0] <= !rem_result_ff[2*XLEN];
+              if (rem_result_ff[2*XLEN]) begin
+                rem_result_ff[2*XLEN:XLEN] <= rem_result_ff[2*XLEN:XLEN] + div_operand_b_ff[XLEN-1:0];
+              end
+            end
+
+            DIV_SIGN_CHANGE: begin
+              rem_result_ff[2*XLEN:XLEN] <= ~rem_result_ff[2*XLEN:XLEN] + 'd1;
+              div_result_ff <= ~div_result_ff + 'd1;
+            end
+
+            default: ;
+          endcase
+        end
+      end
+
+    end
+  endgenerate
+
+  assign div_result_o = div_result_ff;
+  assign rem_result_o = rem_result_ff[2*XLEN-1:XLEN];
+
+  initial begin
+    if ((DIV_IMPLEMENTATION != "XILINX_7_SERIES") &&
+         (DIV_IMPLEMENTATION != "GENERIC")) begin
+      $error("Illegal parameter 'DIV_IMPLEMENTATION' in module 'mrv1f_div': %s", DIV_IMPLEMENTATION);
+    end
+  end
+
+endmodule
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_decoder
+  import miriscv_pkg::XLEN;
+  import miriscv_pkg::ILEN;
+  import miriscv_pkg::RV32M;
+  import miriscv_opcodes_pkg::*;
+  import miriscv_alu_pkg::*;
+  import miriscv_mdu_pkg::*;
+  import miriscv_decode_pkg::*;
+  import miriscv_lsu_pkg::*;
+(
+  // Instuction input
+  input  logic [ILEN-1:0]         decode_instr_i,
+
+  // Decoded instruction
+  output logic                    decode_rs1_re_o,
+  output logic                    decode_rs2_re_o,
+
+  output logic [OP1_SEL_W-1:0]    decode_ex_op1_sel_o,
+  output logic [OP2_SEL_W-1:0]    decode_ex_op2_sel_o,
+
+  output logic [ALU_OP_W-1:0]     decode_alu_operation_o,
+
+  output logic [MDU_OP_W-1:0]     decode_mdu_operation_o,
+  output logic                    decode_ex_mdu_req_o,
+
+  output logic                    decode_mem_we_o,
+  output logic [MEM_ACCESS_W-1:0] decode_mem_size_o,
+  output logic                    decode_mem_req_o,
+
+  output logic [WB_SRC_W-1:0]     decode_wb_src_sel_o,
+
+  output logic                    decode_wb_we_o,
+
+  output logic                    decode_fence_o,
+  output logic                    decode_branch_o,
+  output logic                    decode_jal_o,
+  output logic                    decode_jalr_o,
+  output logic                    decode_load_o,
+
+  output logic                    decode_illegal_instr_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic [6:0] funct7;
+  logic [4:0] opcode;
+  logic [2:0] funct3;
+
+  logic [ALU_OP_W-1:0] alu_op;
+
+  logic       ill_fence;
+  logic       ill_op;
+  logic       ill_opimm;
+  logic       ill_load;
+  logic       ill_store;
+  logic       ill_branch;
+  logic       ill_opcode;
+  logic       ill_op_mul;
+  logic       ill_op_s;
+  logic       ill_op_others;
+  logic       ill_last_bits;
+
+
+  //////////////////////////
+  // Instruction decoding //
+  //////////////////////////
+
+  assign opcode = decode_instr_i[6:2];
+  assign funct3 = decode_instr_i[14:12];
+  assign funct7 = decode_instr_i[31:25];
+
+  assign decode_rs1_re_o        = (decode_ex_op1_sel_o == RS1_DATA) && !decode_illegal_instr_o;
+  assign decode_rs2_re_o        = (decode_ex_op2_sel_o == RS2_DATA) && !decode_illegal_instr_o;
+  assign decode_ex_mdu_req_o    = (opcode == S_OPCODE_OP) && (funct7 == 1'b1) && !(ill_last_bits || ill_op_mul);
+  assign decode_wb_we_o         = !((opcode == S_OPCODE_FENCE) || decode_illegal_instr_o ||
+                                    (opcode[3:0] == 4'b1000)); // STORE or BRANCH
+
+  assign decode_mem_req_o       = ((opcode == S_OPCODE_LOAD) || (opcode == S_OPCODE_STORE)) &&
+                                    !(ill_load|| ill_store || ill_last_bits);
+
+  assign decode_mem_we_o        = (opcode == S_OPCODE_STORE) && !(ill_store || ill_last_bits);
+
+
+  assign decode_load_o          = ((opcode == S_OPCODE_LOAD)) &&
+                                    !(ill_load || ill_last_bits);
+
+  assign decode_illegal_instr_o = ill_fence || ill_op || ill_opimm ||
+                                  ill_load || ill_store || ill_branch ||
+                                  ill_opcode || ill_last_bits;
+
+  assign decode_fence_o         = (opcode == S_OPCODE_FENCE) && !(ill_fence || ill_last_bits);
+
+  assign ill_last_bits = (decode_instr_i[1:0] != 2'b11);
+
+  always_comb begin
+    ill_fence     = 1'b0;
+    ill_op        = 1'b0;
+    ill_opimm     = 1'b0;
+    ill_load      = 1'b0;
+    ill_store     = 1'b0;
+    ill_branch    = 1'b0;
+    ill_op_mul    = 1'b0;
+    ill_op_s      = 1'b0;
+    ill_op_others = 1'b0;
+
+    if(opcode == S_OPCODE_FENCE || opcode == S_OPCODE_JALR) begin
+      if(funct3 != 3'b0) begin
+        ill_fence = 1'b1;
+      end
+    end
+
+    if(funct7 != 7'd0 && funct7 != 7'b010_0000 && funct7 != 3'd1) begin
+      ill_op_others = 1'b1;
+    end
+
+    if(funct7 == 7'b010_0000 && funct3 != 3'b000 && funct3 != 3'b101) begin
+      ill_op_s = 1'b1;
+    end
+
+    if(funct7 == 7'd1 && !RV32M) begin
+      ill_op_mul = 1'b1;
+    end
+
+    if(opcode == S_OPCODE_OP) begin
+      ill_op = ill_op_others || ill_op_s || ill_op_mul;
+    end
+
+    if(opcode == S_OPCODE_OPIMM) begin
+      if((funct3[1:0] == 2'b01 && {funct7[6], funct7[4:0]} != 6'd0) ||
+         (funct3 == 3'b001 && funct7[5] == 1'b1)) begin
+        ill_opimm = 1'b1;
+      end
+    end
+
+    if(opcode == S_OPCODE_LOAD) begin
+      if(funct3 == 3 || funct3 > 5) begin
+        ill_load = 1'b1;
+      end
+    end
+
+    if(opcode == S_OPCODE_STORE) begin
+      if(funct3 > 2) begin
+          ill_store = 1'b1;
+      end
+    end
+
+    if(opcode == S_OPCODE_BRANCH) begin
+      if(funct3 == 3'b010 || funct3 == 3'b011) begin
+        ill_branch = 1'b1;
+      end
+    end
+
+    case(opcode)
+      S_OPCODE_FENCE:  ill_opcode = 1'b0;
+      S_OPCODE_OP:     ill_opcode = 1'b0;
+      S_OPCODE_OPIMM:  ill_opcode = 1'b0;
+      S_OPCODE_LOAD:   ill_opcode = 1'b0;
+      S_OPCODE_STORE:  ill_opcode = 1'b0;
+      S_OPCODE_BRANCH: ill_opcode = 1'b0;
+      S_OPCODE_JAL:    ill_opcode = 1'b0;
+      S_OPCODE_JALR:   ill_opcode = 1'b0;
+      S_OPCODE_AUIPC:  ill_opcode = 1'b0;
+      S_OPCODE_LUI:    ill_opcode = 1'b0;
+      default:         ill_opcode = 1'b1;
+    endcase
+
+  end
+
+  always_comb begin
+    decode_jal_o    = 1'b0;
+    decode_jalr_o   = 1'b0;
+    decode_branch_o = 1'b0;
+
+    unique case(opcode)
+      S_OPCODE_LUI:   decode_ex_op1_sel_o = ZERO;
+      S_OPCODE_AUIPC: decode_ex_op1_sel_o = CURRENT_PC;
+      S_OPCODE_JAL:   decode_ex_op1_sel_o = ZERO;
+      S_OPCODE_FENCE: decode_ex_op1_sel_o = ZERO;
+      default:        decode_ex_op1_sel_o = RS1_DATA;
+    endcase
+
+    unique case(opcode)
+      S_OPCODE_OP,
+      S_OPCODE_BRANCH,
+      S_OPCODE_STORE:   decode_ex_op2_sel_o = RS2_DATA;
+      S_OPCODE_AUIPC,
+      S_OPCODE_LUI:     decode_ex_op2_sel_o = IMM_U;
+      S_OPCODE_JAL,
+      S_OPCODE_JALR:    decode_ex_op2_sel_o = NEXT_PC;
+      default:          decode_ex_op2_sel_o = IMM_I;
+
+    endcase
+
+    unique case(opcode)
+      S_OPCODE_LOAD: decode_wb_src_sel_o = LSU_DATA;
+      default:       decode_wb_src_sel_o = decode_ex_mdu_req_o ? MDU_DATA : ALU_DATA;
+    endcase
+
+    unique case(funct3)
+      3'b000:  decode_mem_size_o = MEM_ACCESS_BYTE;
+      3'b001:  decode_mem_size_o = MEM_ACCESS_HALF;
+      3'b100:  decode_mem_size_o = MEM_ACCESS_UBYTE;
+      3'b101:  decode_mem_size_o = MEM_ACCESS_UHALF;
+      default: decode_mem_size_o = MEM_ACCESS_WORD;
+    endcase
+
+    unique case(funct3)
+      3'b000:  decode_mdu_operation_o = MDU_MUL;
+      3'b001:  decode_mdu_operation_o = MDU_MULH;
+      3'b010:  decode_mdu_operation_o = MDU_MULHSU;
+      3'b011:  decode_mdu_operation_o = MDU_MULHU;
+      3'b100:  decode_mdu_operation_o = MDU_DIV;
+      3'b101:  decode_mdu_operation_o = MDU_DIVU;
+      3'b110:  decode_mdu_operation_o = MDU_REM;
+      default: decode_mdu_operation_o = MDU_REMU;
+    endcase
+
+    case({funct7[5],funct3,opcode}) inside
+      {1'b1,3'b000,S_OPCODE_OP}:      alu_op = ALU_SUB;
+      {1'b?,3'b010,5'b0?100}:         alu_op = ALU_SLT;
+      {1'b?,3'b011,5'b0?100}:         alu_op = ALU_SLTU;
+      {1'b?,3'b100,5'b0?100}:         alu_op = ALU_XOR;
+      {1'b?,3'b110,5'b0?100}:         alu_op = ALU_OR;
+      {1'b?,3'b111,5'b0?100}:         alu_op = ALU_AND;
+      {1'b?,3'b001,5'b0?100}:         alu_op = ALU_SLL;
+      {1'b0,3'b101,5'b0?100}:         alu_op = ALU_SRL;
+      {1'b1,3'b101,5'b0?100}:         alu_op = ALU_SRA;
+      {1'b?,3'b000,S_OPCODE_BRANCH}:  alu_op = ALU_EQ;
+      {1'b?,3'b001,S_OPCODE_BRANCH}:  alu_op = ALU_NE;
+      {1'b?,3'b100,S_OPCODE_BRANCH}:  alu_op = ALU_LT;
+      {1'b?,3'b101,S_OPCODE_BRANCH}:  alu_op = ALU_GE;
+      {1'b?,3'b110,S_OPCODE_BRANCH}:  alu_op = ALU_LTU;
+      {1'b?,3'b111,S_OPCODE_BRANCH}:  alu_op = ALU_GEU;
+      {1'b?,3'b???,S_OPCODE_JALR},
+      {1'b?,3'b???,S_OPCODE_JAL}:     alu_op = ALU_JAL;
+      default:                        alu_op = ALU_ADD;
+    endcase
+
+    if (decode_illegal_instr_o) begin
+      decode_alu_operation_o = ALU_ADD;
+    end
+    else if(decode_ex_mdu_req_o == 1'b1) begin
+      decode_alu_operation_o = ALU_ADD;
+    end
+    else begin
+      decode_alu_operation_o = alu_op;
+    end
+
+    if(opcode[4:2] == 3'b110) begin
+      case(opcode[1:0])
+        2'b01:    decode_jalr_o   = !(ill_last_bits || ill_fence);
+        2'b11:    decode_jal_o    = !(ill_last_bits);
+        default:  decode_branch_o = !(ill_last_bits || ill_branch);
+      endcase
+    end
+
+  end
+
+endmodule
+
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_control_unit
+  import miriscv_pkg::XLEN;
+  import miriscv_gpr_pkg::GPR_ADDR_W;
+(
+  input  logic                  clk_i,
+  input  logic                  arstn_i,
+
+  input  logic [XLEN-1:0]       boot_addr_i,
+
+  input  logic                  f_stall_req_i,
+  input  logic                  d_stall_req_i,
+  input  logic                  e_stall_req_i,
+  input  logic                  m_stall_req_i,
+
+  input  logic [GPR_ADDR_W-1:0] f_cu_rs1_addr_i,
+  input  logic                  f_cu_rs1_req_i,
+  input  logic [GPR_ADDR_W-1:0] f_cu_rs2_addr_i,
+  input  logic                  f_cu_rs2_req_i,
+
+  input  logic [GPR_ADDR_W-1:0] d_cu_rd_addr_i,
+  input  logic                  d_cu_rd_we_i,
+
+  input  logic [GPR_ADDR_W-1:0] e_cu_rd_addr_i,
+  input  logic                  e_cu_rd_we_i,
+
+  input  logic                  f_valid_i,
+  input  logic                  d_valid_i,
+  input  logic                  e_valid_i,
+  input  logic                  m_valid_i,
+
+  input  logic                  m_branch_i,
+  input  logic                  m_jal_i,
+  input  logic                  m_jalr_i,
+  input  logic [XLEN-1:0]       m_target_pc_i,
+  input  logic [XLEN-1:0]       m_next_pc_i,
+  input  logic                  m_prediction_i,
+  input  logic                  m_br_j_taken_i,
+
+  output logic                  cu_stall_f_o,
+  output logic                  cu_stall_d_o,
+  output logic                  cu_stall_e_o,
+  output logic                  cu_stall_m_o,
+
+  output logic                  cu_kill_f_o,
+  output logic                  cu_kill_d_o,
+  output logic                  cu_kill_e_o,
+  output logic                  cu_kill_m_o,
+
+  output logic [XLEN-1:0]       cu_force_pc_o,
+  output logic                  cu_force_f_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  logic [1:0] boot_addr_load_ff;
+  logic       cu_boot_addr_load_en;
+  logic       cu_mispredict;
+
+  logic       e_raw_hazard_rs1;
+  logic       e_raw_hazard_rs2;
+  logic       e_raw_hazard;
+
+  logic       m_raw_hazard_rs1;
+  logic       m_raw_hazard_rs2;
+  logic       m_raw_hazard;
+
+
+  //////////////////////
+  // Pipeline control //
+  //////////////////////
+
+  always_ff @(posedge clk_i or negedge arstn_i) begin
+    if(~arstn_i) begin
+      boot_addr_load_ff <= 2'b00;
+    end
+    else begin
+      boot_addr_load_ff <= {boot_addr_load_ff[0], 1'b1};
+    end
+  end
+
+  assign cu_boot_addr_load_en = ~boot_addr_load_ff[1];
+
+
+  assign e_raw_hazard_rs1 = f_cu_rs1_req_i & f_valid_i
+                          & d_cu_rd_we_i   & d_valid_i
+                          & (f_cu_rs1_addr_i == d_cu_rd_addr_i)
+                          & (d_cu_rd_addr_i != '0); // No hazards for x0
+
+  assign e_raw_hazard_rs2 = f_cu_rs2_req_i & f_valid_i
+                          & d_cu_rd_we_i   & d_valid_i
+                          & (f_cu_rs2_addr_i == d_cu_rd_addr_i)
+                          & (d_cu_rd_addr_i != '0); // No hazards for x0
+
+
+  assign e_raw_hazard = e_raw_hazard_rs1
+                      | e_raw_hazard_rs2;
+
+  assign m_raw_hazard_rs1 = f_cu_rs1_req_i & f_valid_i
+                          & e_cu_rd_we_i & e_valid_i
+                          & (f_cu_rs1_addr_i == e_cu_rd_addr_i)
+                          & (e_cu_rd_addr_i != '0); // No hazards for x0
+
+  assign m_raw_hazard_rs2 = f_cu_rs2_req_i & f_valid_i
+                          & e_cu_rd_we_i & e_valid_i
+                          & (f_cu_rs2_addr_i == e_cu_rd_addr_i)
+                          & (e_cu_rd_addr_i != '0); // No hazards for x0
+
+  assign m_raw_hazard = m_raw_hazard_rs1
+                      | m_raw_hazard_rs2;
+
+
+  assign cu_stall_f_o = m_stall_req_i | e_stall_req_i | d_stall_req_i | e_raw_hazard | m_raw_hazard;
+  assign cu_stall_d_o = m_stall_req_i | e_stall_req_i | d_stall_req_i;
+  assign cu_stall_e_o = m_stall_req_i | e_stall_req_i;
+  assign cu_stall_m_o = m_stall_req_i;
+
+
+  assign cu_mispredict = m_valid_i & (m_prediction_i ^ m_br_j_taken_i) ;
+
+  assign cu_kill_f_o = cu_mispredict;
+  assign cu_kill_d_o = cu_mispredict;
+  assign cu_kill_e_o = cu_mispredict;
+  assign cu_kill_m_o = cu_mispredict;
+
+
+  assign cu_force_pc_o = cu_boot_addr_load_en ? boot_addr_i
+                                              : m_br_j_taken_i ? m_target_pc_i
+                                                               : m_next_pc_i;
+
+  assign cu_force_f_o = cu_boot_addr_load_en | cu_mispredict;
+
+endmodule
+
+
+
+
+/***********************************************************************************
+ * Copyright (C) 2023 National Research University of Electronic Technology (MIET),
+ * Institute of Microdevices and Control Systems.
+ * See LICENSE file for licensing details.
+ *
+ * This file is a part of miriscv core.
+ *
+ ***********************************************************************************/
+
+module miriscv_lsu
+  import miriscv_pkg::XLEN;
+  import miriscv_lsu_pkg::*;
+(
+  // Clock, reset
+  input  logic                    clk_i,
+  input  logic                    arstn_i,
+
+  // Data memory interface
+  input  logic                    data_rvalid_i,
+  input  logic [XLEN-1:0]         data_rdata_i,
+  output logic                    data_req_o,
+  output logic                    data_we_o,
+  output logic [XLEN/8-1:0]       data_be_o,
+  output logic [XLEN-1:0]         data_addr_o,
+  output logic [XLEN-1:0]         data_wdata_o,
+
+  // Core pipeline signals
+  input  logic                    lsu_req_i,
+  input  logic                    lsu_kill_i,
+  input  logic                    lsu_keep_i,
+  input  logic                    lsu_we_i,
+  input  logic [MEM_ACCESS_W-1:0] lsu_size_i,
+  input  logic [XLEN-1:0]         lsu_addr_i,
+  input  logic [XLEN-1:0]         lsu_data_i,
+  output logic [XLEN-1:0]         lsu_data_o,
+
+  // Control and status signals
+  output logic                    lsu_stall_o
+);
+
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  localparam BYTE_ADDR_W = $clog2(XLEN/8);
+
+  logic [XLEN/8-1:0] data_be;
+
+  logic [XLEN-1:0]   lsu_data;
+
+
+  ///////////
+  // Store //
+  ///////////
+
+
+  always_comb begin
+    case (lsu_size_i)
+
+      MEM_ACCESS_WORD: begin
+        data_be = 4'b1111;
+      end
+
+      MEM_ACCESS_UHALF,
+      MEM_ACCESS_HALF: begin
+        data_be = (4'b0011 << lsu_addr_i[1:0]);
+      end
+
+      MEM_ACCESS_UBYTE,
+      MEM_ACCESS_BYTE: begin
+        data_be = (4'b0001 << lsu_addr_i[1:0]);
+      end
+
+      default: begin
+        data_be = {(XLEN/8){1'b0}};
+      end
+
+    endcase
+
+
+    case (lsu_addr_i[1:0])
+      2'b00:   data_wdata_o = {lsu_data_i[31:0]};
+      2'b01:   data_wdata_o = {lsu_data_i[23:0], lsu_data_i[31:24]};
+      2'b10:   data_wdata_o = {lsu_data_i[15:0], lsu_data_i[31:16]};
+      2'b11:   data_wdata_o = {lsu_data_i[ 7:0], lsu_data_i[31: 8]};
+      default: data_wdata_o = {XLEN{1'b0}};
+    endcase
+  end
+
+
+  //////////
+  // Load //
+  //////////
+
+  always_comb begin
+    case (lsu_size_i)
+
+      MEM_ACCESS_WORD: begin
+        case (lsu_addr_i[1:0])
+          2'b00:   lsu_data_o = data_rdata_i[31:0];
+          default: lsu_data_o = {XLEN{1'b0}};
+        endcase
+      end
+
+      MEM_ACCESS_HALF: begin
+        case (lsu_addr_i[1:0])
+          2'b00:   lsu_data_o = {{(XLEN-16){data_rdata_i[15]}}, data_rdata_i[15: 0]};
+          2'b01:   lsu_data_o = {{(XLEN-16){data_rdata_i[23]}}, data_rdata_i[23: 8]};
+          2'b10:   lsu_data_o = {{(XLEN-16){data_rdata_i[31]}}, data_rdata_i[31:16]};
+          default: lsu_data_o = {XLEN{1'b0}};
+        endcase
+      end
+
+      MEM_ACCESS_BYTE: begin
+        case (lsu_addr_i[1:0])
+          2'b00:   lsu_data_o = {{(XLEN-8){data_rdata_i[ 7]}}, data_rdata_i[ 7: 0]};
+          2'b01:   lsu_data_o = {{(XLEN-8){data_rdata_i[15]}}, data_rdata_i[15: 8]};
+          2'b10:   lsu_data_o = {{(XLEN-8){data_rdata_i[23]}}, data_rdata_i[23:16]};
+          2'b11:   lsu_data_o = {{(XLEN-8){data_rdata_i[31]}}, data_rdata_i[31:24]};
+          default: lsu_data_o = {XLEN{1'b0}};
+        endcase
+      end
+
+      MEM_ACCESS_UHALF: begin
+        case (lsu_addr_i[1:0])
+          2'b00:   lsu_data_o = {{(XLEN-16){1'b0}}, data_rdata_i[15: 0]};
+          2'b01:   lsu_data_o = {{(XLEN-16){1'b0}}, data_rdata_i[23: 8]};
+          2'b10:   lsu_data_o = {{(XLEN-16){1'b0}}, data_rdata_i[31:16]};
+          default: lsu_data_o = {XLEN{1'b0}};
+        endcase
+      end
+
+      MEM_ACCESS_UBYTE: begin
+        case (lsu_addr_i[1:0])
+          2'b00:   lsu_data_o = {{(XLEN-8){1'b0}}, data_rdata_i[ 7: 0]};
+          2'b01:   lsu_data_o = {{(XLEN-8){1'b0}}, data_rdata_i[15: 8]};
+          2'b10:   lsu_data_o = {{(XLEN-8){1'b0}}, data_rdata_i[23:16]};
+          2'b11:   lsu_data_o = {{(XLEN-8){1'b0}}, data_rdata_i[31:24]};
+          default: lsu_data_o = {XLEN{1'b0}};
+        endcase
+      end
+
+      default: begin
+        lsu_data_o = {XLEN{1'b0}};
+      end
+
+    endcase
+  end
+
+
+  assign data_req_o  = lsu_req_i & ~lsu_kill_i & ~data_rvalid_i;
+  assign data_addr_o = lsu_addr_i;
+  assign data_we_o   = lsu_we_i;
+  assign data_be_o   = data_be;
+
+  assign lsu_stall_o = data_req_o;
+
+endmodule
