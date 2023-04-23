@@ -3561,3 +3561,89 @@ endmodule
 
 https://github.com/toTheSky
 https://github.com/toTheSky/Plisanutie_rtl-track/blob/develop_Den/links.txt
+module miriscv_gpr
+  import miriscv_pkg::XLEN;
+  import miriscv_gpr_pkg::*;
+
+  (
+    // Clock, reset
+    input  logic                  clk_i,
+    input  logic                  arstn_i,
+
+    // Write port
+    input  logic                  wr_en_i,
+    input  logic [GPR_ADDR_W-1:0] wr_addr_i,
+    input  logic [XLEN-1:0]       wr_data_i,
+
+    // Read port 1
+    input  logic [GPR_ADDR_W-1:0] r1_addr_i,
+    output logic [XLEN-1:0]       r1_data_o,
+
+    // Read port 2
+    input  logic [GPR_ADDR_W-1:0] r2_addr_i,
+    output logic [XLEN-1:0]       r2_data_o
+  );
+
+  ////////////////////////
+  // Local declarations //
+  ////////////////////////
+
+  localparam NUM_WORDS = 2**GPR_ADDR_W;  // Объявление локального параметра NUM_WORDS, который равен 2 в степени GPR_ADDR_W.
+
+  logic [NUM_WORDS-1:0][XLEN-1:0] rf_reg;         // Объявление 2D массива rf_reg с размерностью NUM_WORDS-1 на XLEN-1. Он представляет общие регистры для хранения значений регистров.
+  logic [NUM_WORDS-1:0][XLEN-1:0] rf_reg_tmp_ff;  // Объявление 2D массива rf_reg_tmp_ff с размерностью NUM_WORDS-1 на XLEN-1. Он представляет временные регистры, используемые в логике записи.
+  logic [NUM_WORDS-1:0]           wr_en_dec;      // Объявление 1D массива wr_en_dec с размерностью NUM_WORDS-1. Он представляет собой 1-битовый сигнал для каждого регистра, который определяет, разрешена ли запись в данный регистр.
+
+  // Объявление RAM с использованием массива
+  logic [XLEN-1:0] mem [NUM_WORDS-1:0]; // Определение RAM с размером NUM_WORDS-1 на XLEN-1. Каждый элемент массива является XLEN-битным словом, которое может быть прочитано или записано.
+
+  ///////////////////////////////
+  // General purpose registers //
+  ///////////////////////////////
+
+  // Логика декодирования wr_en_i для получения wr_en_dec.
+  always_comb begin : wr_en_decoder
+    for (int i = 0; i < NUM_WORDS; i++) begin
+      if (wr_addr_i == i)
+        wr_en_dec[i] = wr_en_i;
+      else
+        wr_en_dec[i] = 1'b0;
+    end
+  end
+
+  // Логика записи в RAM.
+  always_ff @(posedge clk_i or negedge arstn_i) begin : register_write_behavioral
+    if (arstn_i==1'b0) begin
+      mem <= 'b0; // сброс
+    end else begin
+      mem[wr
+
+_addr_i] <= wr_data_i; // Запись данных wr_data_i в память по адресу wr_addr_i
+end
+end
+
+// Логика чтения из регистра
+assign r1_data_o = rf_reg[r1_addr_i];
+assign r2_data_o = rf_reg[r2_addr_i];
+
+// Логика записи в регистры
+always_ff @(posedge clk_i or negedge arstn_i) begin : register_write
+if (arstn_i == 1'b0) begin
+rf_reg <= 'b0; // Сброс регистров
+end else begin
+rf_reg_tmp_ff <= rf_reg; // Сохранение текущих значений регистров во временных регистрах
+
+arduino
+
+  for (int i = 0; i < NUM_WORDS; i++) begin
+    if (wr_en_dec[i] == 1'b1) begin
+      rf_reg_tmp_ff[i] <= wr_data_i;  // Запись данных wr_data_i в временный регистр по адресу i, если запись разрешена.
+    end
+  end
+
+  rf_reg <= rf_reg_tmp_ff; // Обновление значений общих регистров из временных регистров
+end
+
+end
+
+endmodule
